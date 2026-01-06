@@ -1,10 +1,12 @@
-import logging
 import os
 from collections import Counter, defaultdict
 from collections.abc import Callable
 from typing import BinaryIO
 
 import regex as re
+
+PAT = r"""'(?:[sdmt]|ll|ve|re)| ?\p{L}+| ?\p{N}+| ?[^\s\p{L}\p{N}]+|\s+(?!\S)|\s+"""
+PAT = re.compile(PAT)
 
 
 def find_chunk_boundaries(
@@ -54,10 +56,6 @@ def find_chunk_boundaries(
     return sorted(set(chunk_boundaries))
 
 
-PAT = r"""'(?:[sdmt]|ll|ve|re)| ?\p{L}+| ?\p{N}+| ?[^\s\p{L}\p{N}]+|\s+(?!\S)|\s+"""
-PAT = re.compile(PAT)
-
-
 def simple_splitter(chunk: str):
     for match in PAT.finditer(chunk):
         yield match.group()
@@ -87,71 +85,9 @@ def pretokenize(
             for mini_chunk in mini_chunks:
                 for pretoken in splitter(mini_chunk):
                     counter[pretoken] += 1
+    # with open(input_path, "r") as f:
+    #     text = f.read()
 
+    # text = text.replace(special_token, "")
+    # counter = Counter(PAT.findall(text))
     return counter
-
-
-special_tokens = ["<|endoftext|>"]
-special_token_bytes = [x.encode() for x in special_tokens]
-
-vocab: dict[int, bytes] = {i: bytes([i]) for i in range(256)}
-for i, token_bytes in enumerate(special_token_bytes):
-    vocab[i + 256] = bytes(token_bytes)
-
-pretoken_counts = pretokenize("./data/TinyStoriesV2-GPT4-valid.txt", 1)
-pretoken_counts: dict[tuple[bytes], int] = {tuple(k.encode("utf8")): v for k, v in pretoken_counts.items()}
-
-token_counts = defaultdict(int)
-for pretoken, count in pretoken_counts.items():
-    for i in range(len(pretoken) - 1):
-        token_counts[pretoken[i : i + 2]] += count
-
-
-def get_most(counts: Counter[tuple[bytes], int]):
-    """Break ties in pair frequency by preferring the lexicographically greater pair"""
-    ties = []
-    max_count = 0
-    for tokens, count in counts.items():
-        if count < max_count:
-            continue
-        elif count > max_count:
-            max_count = count
-            ties = [tokens]
-        elif count == max_count:
-            ties.append(tokens)
-    return max(ties), max_count
-
-
-tokens_to_merge, _ = get_most(token_counts)
-new_id = len(vocab)
-left, right = tokens_to_merge
-
-
-def decode(tokens):
-    chars = []
-    for t in tokens:
-        try:
-            if t > 255:
-                raise
-            t = chr(t)
-        except:
-            pass
-        chars.append(t)
-    return chars
-
-
-for tokens, count in pretoken_counts.copy().items():
-    new_tokens = []
-    updated = False
-    i = 0
-    while i < len(tokens) - 1:
-        if tokens[i] == left and tokens[i + 1] == right:
-            new_tokens.append(new_id)
-            updated = True
-            i += 2
-        else:
-            new_tokens.append(tokens[i])
-            i += 1
-    if updated:
-        pretoken_counts[tuple(new_tokens)] = pretoken_counts.pop(tokens)
-        print(f"{decode(tokens)} -> {decode(new_tokens)}")
