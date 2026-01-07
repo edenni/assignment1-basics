@@ -76,12 +76,24 @@ class SwiGLU(nn.Module):
 
     def reset_parameters(self):
         std = math.sqrt(2 / (self.d_model + self.d_ff))
-        nn.init.trunc_normal_(self.w1, std=std, a=-3 * std, b=3 * std)
-        nn.init.trunc_normal_(self.w2, std=std, a=-3 * std, b=3 * std)
-        nn.init.trunc_normal_(self.w3, std=std, a=-3 * std, b=3 * std)
+        for w in (self.w1, self.w2, self.w3):
+            nn.init.trunc_normal_(w, std=std, a=-3 * std, b=3 * std)
+
+
+class RotaryPositionalEmbedding(nn.Module):
+    def __init__(self, theta: float, d_k: int, max_seq_len: int, device=None): ...
+
+    def forward(self, x): ...
 
 
 if __name__ == "__main__":
-    model = SwiGLU(16, 64)
-    x = torch.randn(10, 16)
-    print(model(x).shape)
+    d = 64
+    max_seq_len = 128
+    theta_base = 10
+    theta = torch.tensor(theta_base).unsqueeze(0).repeat(d // 2)
+    k = torch.arange(d // 2)
+    theta = theta ** (-2 * k / d)
+    i = torch.arange(max_seq_len)
+    print(theta.shape)
+    print(i.shape)
+    print(torch.outer(i, theta).shape)
