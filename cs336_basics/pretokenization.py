@@ -1,5 +1,5 @@
 import os
-from collections import Counter, defaultdict
+from collections import defaultdict
 from collections.abc import Callable
 from typing import BinaryIO
 
@@ -85,9 +85,4 @@ def pretokenize(
             for mini_chunk in mini_chunks:
                 for pretoken in splitter(mini_chunk):
                     counter[pretoken] += 1
-    # with open(input_path, "r") as f:
-    #     text = f.read()
-
-    # text = text.replace(special_token, "")
-    # counter = Counter(PAT.findall(text))
     return counter

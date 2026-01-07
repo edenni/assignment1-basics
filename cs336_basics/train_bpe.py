@@ -93,7 +93,7 @@ def train_bpe(
     # merge
     merges: list[tuple[bytes, bytes]] = []
     token_pair_counts = None
-    for i in tqdm(range(vocab_size - len(vocab))):
+    for i in tqdm(range(vocab_size - len(vocab)), desc="Train BPE"):
         vocab, pre_token_counts, token_pair_counts, merged = _one_step(vocab, pre_token_counts, token_pair_counts)
         merges.append(merged)
     return vocab, merges
