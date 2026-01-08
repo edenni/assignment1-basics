@@ -116,6 +116,13 @@ def softmax(x, dim=-1):
     return o.exp() / o.exp().sum(dim=dim, keepdim=True)
 
 
+def scaled_dot_product_attention(q, k, v, mask=None):
+    att = (q @ k.transpose(-2, -1)) * (1.0 / math.sqrt(k.size(-1)))
+    if mask is not None:
+        att.masked_fill_(~mask, float("-inf"))
+    return softmax(att) @ v
+
+
 if __name__ == "__main__":
     d = 64
     max_seq_len = 128
