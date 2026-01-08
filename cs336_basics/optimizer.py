@@ -47,3 +47,13 @@ def get_cosine_lr(t: int, lr_max: float, lr_min: float, warmup_steps: int, cosin
         return cos_lr
     else:
         return lr_min
+
+
+def clip_grad_norm(params, max_norm: float = 1.0, eps: float = 1e-6):
+    total_norm = sum([torch.sum(p.grad**2) for p in params if p.grad is not None])
+    total_norm = total_norm**0.5
+    if total_norm >= max_norm:
+        with torch.no_grad():
+            for p in params:
+                if p.grad is not None:
+                    p.grad.mul_(max_norm / (total_norm + eps))
