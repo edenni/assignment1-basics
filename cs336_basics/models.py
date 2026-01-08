@@ -111,11 +111,16 @@ class RotaryPositionalEmbedding(nn.Module):
         return x.type(in_dtype)
 
 
+def softmax(x, dim=-1):
+    o = x - x.max(dim=dim, keepdim=True)[0]
+    return o.exp() / o.exp().sum(dim=dim, keepdim=True)
+
+
 if __name__ == "__main__":
     d = 64
     max_seq_len = 128
     theta_base = 10
 
-    x = torch.arange(24)
+    x = torch.arange(24).reshape(3, 8)
 
-    print(repeat(x, "... n -> ... (n r)", r=2))
+    print(softmax(x).sum(dim=1))
