@@ -216,6 +216,13 @@ class Transformer(nn.Module):
         return x
 
 
+def cross_entropy(inputs, targets):
+    o = inputs - inputs.max(dim=-1, keepdim=True)[0]
+    log_softmax = o - torch.logsumexp(o, dim=-1, keepdim=True)
+    target_loss = log_softmax.gather(dim=-1, index=targets.unsqueeze(-1))
+    return -target_loss.mean()
+
+
 if __name__ == "__main__":
     d = 64
     max_seq_len = 128
