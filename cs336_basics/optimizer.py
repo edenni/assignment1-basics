@@ -1,3 +1,5 @@
+import math
+
 import torch
 import torch.optim as optim
 
@@ -33,3 +35,15 @@ class AdamW(optim.Optimizer):
                 state["v"] = v
 
         return loss
+
+
+def get_cosine_lr(t: int, lr_max: float, lr_min: float, warmup_steps: int, cosine_steps: int) -> float:
+    if t < warmup_steps:
+        return t / warmup_steps * lr_max
+    elif warmup_steps <= t < cosine_steps:
+        cos_lr = lr_min + 0.5 * (1 + math.cos((t - warmup_steps) / (cosine_steps - warmup_steps) * math.pi)) * (
+            lr_max - lr_min
+        )
+        return cos_lr
+    else:
+        return lr_min
