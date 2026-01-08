@@ -11,15 +11,15 @@ class Linear(nn.Module):
         self.in_features = in_features
         self.out_features = out_features
 
-        self.W = nn.Parameter(torch.empty(out_features, in_features, device=device, dtype=dtype))
+        self.weight = nn.Parameter(torch.empty(out_features, in_features, device=device, dtype=dtype))
         self.reset_parameters()
 
     def forward(self, x):
-        return x @ self.W.T
+        return x @ self.weight.T
 
     def reset_parameters(self):
         std = math.sqrt(2 / (self.in_features + self.out_features))
-        nn.init.trunc_normal_(self.W, std=std, a=-3 * std, b=3 * std)
+        nn.init.trunc_normal_(self.weight, std=std, a=-3 * std, b=3 * std)
 
 
 class Embedding(nn.Module):
@@ -100,7 +100,7 @@ class RotaryPositionalEmbedding(nn.Module):
         self.register_buffer("theta", theta, persistent=False)
 
     @torch.autocast("cuda", enabled=False)
-    def forward(self, x, token_positions):
+    def forward(self, x, token_positions=None):
         in_dtype = x.dtype
         if token_positions is not None:
             theta = self.theta[token_positions]  # seq_len d_k // 2
@@ -121,6 +121,39 @@ def scaled_dot_product_attention(q, k, v, mask=None):
     if mask is not None:
         att.masked_fill_(~mask, float("-inf"))
     return softmax(att) @ v
+
+
+class MultiHeadSelfAttention(nn.Module):
+    def __init__(self, d_model, num_heads, theta=10000, max_seq_len=8192, device=None, dtype=None):
+        super().__init__()
+        assert d_model % num_heads == 0
+        self.d_model = d_model
+        self.num_heads = num_heads
+        self.d_head = self.d_model // self.num_heads
+        self.qkv_proj = Linear(d_model, 3 * d_model, device=device, dtype=dtype)
+        self.o_proj = Linear(d_model, d_model, device=device, dtype=dtype)
+        if theta > 0:
+            self.rope = RotaryPositionalEmbedding(theta, d_model // num_heads, max_seq_len, device=device)
+        else:
+            self.rope = None
+
+    def forward(self, x, token_positions=None):
+        B, L, D = x.size()
+        qkv = self.qkv_proj(x)
+        q, k, v = qkv.chunk(3, dim=-1)
+        q = q.view(B, L, self.num_heads, self.d_head).transpose(1, 2)
+        k = k.view(B, L, self.num_heads, self.d_head).transpose(1, 2)
+        v = v.view(B, L, self.num_heads, self.d_head).transpose(1, 2)
+
+        if self.rope:
+            q = self.rope(q, token_positions)
+            k = self.rope(k, token_positions)
+
+        mask = torch.tril(torch.ones(L, L, device=q.device)).unsqueeze(0).bool()
+        y = scaled_dot_product_attention(q, k, v, mask)
+        y = y.transpose(1, 2).contiguous().view(B, L, D)
+        o = self.o_proj(y)
+        return o
 
 
 if __name__ == "__main__":
