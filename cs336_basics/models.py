@@ -89,6 +89,8 @@ def rotate_pair(x):
     return rearrange(x, "... d r -> ... (d r)")
 
 
+# https://kexue.fm/archives/8265
+# https://github.com/lucidrains/rotary-embedding-torch/blob/main/rotary_embedding_torch/rotary_embedding_torch.py
 class RotaryPositionalEmbedding(nn.Module):
     def __init__(self, theta: float, d_k: int, max_seq_len: int, device=None):
         super().__init__()
