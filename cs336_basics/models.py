@@ -2,6 +2,7 @@ import math
 
 import torch
 import torch.nn as nn
+from einops import rearrange, repeat
 
 
 class Linear(nn.Module):
@@ -44,12 +45,13 @@ class RMSNorm(nn.Module):
         self.eps = eps
         self.gain = nn.Parameter(torch.ones(d_model, device=device, dtype=dtype))
 
+    @torch.autocast("cuda", enabled=False)
     def forward(self, x):
         in_dtype = x.dtype
         x = x.to(torch.float32)
         reverse_rms = torch.rsqrt((x * x).mean(-1) + self.eps).unsqueeze(-1)
         out = x * reverse_rms * self.gain
-        return out.to(in_dtype)
+        return out.type(in_dtype)
 
 
 class Swish(nn.Module):
@@ -80,20 +82,38 @@ class SwiGLU(nn.Module):
             nn.init.trunc_normal_(w, std=std, a=-3 * std, b=3 * std)
 
 
-class RotaryPositionalEmbedding(nn.Module):
-    def __init__(self, theta: float, d_k: int, max_seq_len: int, device=None): ...
+def rotate_pair(x):
+    x = rearrange(x, "... (d r) -> ... d r", r=2)
+    x1, x2 = x.unbind(dim=-1)
+    x = torch.stack((-x2, x1), dim=-1)
+    return rearrange(x, "... d r -> ... (d r)")
 
-    def forward(self, x): ...
+
+class RotaryPositionalEmbedding(nn.Module):
+    def __init__(self, theta: float, d_k: int, max_seq_len: int, device=None):
+        super().__init__()
+        theta = 1.0 / (theta ** (torch.arange(0, d_k, 2) / d_k))
+        i = torch.arange(max_seq_len)
+        theta = torch.outer(i, theta)
+        self.register_buffer("theta", theta, persistent=False)
+
+    @torch.autocast("cuda", enabled=False)
+    def forward(self, x, token_positions):
+        in_dtype = x.dtype
+        if token_positions is not None:
+            theta = self.theta[token_positions]  # seq_len d_k // 2
+        else:
+            theta = self.theta[: x.size(-2)]
+        theta = repeat(theta, "... n -> ... (n r)", r=2)
+        x = x * theta.cos() + rotate_pair(x) * theta.sin()
+        return x.type(in_dtype)
 
 
 if __name__ == "__main__":
     d = 64
     max_seq_len = 128
     theta_base = 10
-    theta = torch.tensor(theta_base).unsqueeze(0).repeat(d // 2)
-    k = torch.arange(d // 2)
-    theta = theta ** (-2 * k / d)
-    i = torch.arange(max_seq_len)
-    print(theta.shape)
-    print(i.shape)
-    print(torch.outer(i, theta).shape)
+
+    x = torch.arange(24)
+
+    print(repeat(x, "... n -> ... (n r)", r=2))
