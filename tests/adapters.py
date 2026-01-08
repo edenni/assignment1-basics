@@ -306,7 +306,29 @@ def run_transformer_block(
         Float[Tensor, "batch sequence_length d_model"] Tensor with the output of
         running the Transformer block on the input features while using RoPE.
     """
-    raise NotImplementedError
+    from cs336_basics.models import TransformerBlock
+
+    block = TransformerBlock(d_model, num_heads, d_ff, max_seq_len, theta)
+    block.load_state_dict(
+        {
+            "attn.qkv_proj.weight": torch.cat(
+                [
+                    weights["attn.q_proj.weight"],
+                    weights["attn.k_proj.weight"],
+                    weights["attn.v_proj.weight"],
+                ],
+                0,
+            ),
+            "attn.o_proj.weight": weights["attn.output_proj.weight"],
+            "ln1.gain": weights["ln1.weight"],
+            "ln2.gain": weights["ln2.weight"],
+            "ffn.w1": weights["ffn.w1.weight"],
+            "ffn.w2": weights["ffn.w2.weight"],
+            "ffn.w3": weights["ffn.w3.weight"],
+        }
+    )
+
+    return block(in_features)
 
 
 def run_transformer_lm(
@@ -388,7 +410,37 @@ def run_transformer_lm(
         Float[Tensor, "batch_size sequence_length vocab_size"]: Tensor with the predicted unnormalized
         next-word distribution for each token.
     """
-    raise NotImplementedError
+    from cs336_basics.models import Transformer
+
+    model = Transformer(num_layers, vocab_size, context_length, d_model, num_heads, d_ff, theta=rope_theta)
+
+    state_dict = {
+        "token_embeddings.embed": weights["token_embeddings.weight"],
+        "ln_final.gain": weights["ln_final.weight"],
+        "lm_head.weight": weights["lm_head.weight"],
+    }
+
+    for layer in range(num_layers):
+        state_dict.update(
+            {
+                f"layers.{layer}.attn.qkv_proj.weight": torch.cat(
+                    [
+                        weights[f"layers.{layer}.attn.q_proj.weight"],
+                        weights[f"layers.{layer}.attn.k_proj.weight"],
+                        weights[f"layers.{layer}.attn.v_proj.weight"],
+                    ],
+                    0,
+                ),
+                f"layers.{layer}.attn.o_proj.weight": weights[f"layers.{layer}.attn.output_proj.weight"],
+                f"layers.{layer}.ln1.gain": weights[f"layers.{layer}.ln1.weight"],
+                f"layers.{layer}.ln2.gain": weights[f"layers.{layer}.ln2.weight"],
+                f"layers.{layer}.ffn.w1": weights[f"layers.{layer}.ffn.w1.weight"],
+                f"layers.{layer}.ffn.w2": weights[f"layers.{layer}.ffn.w2.weight"],
+                f"layers.{layer}.ffn.w3": weights[f"layers.{layer}.ffn.w3.weight"],
+            }
+        )
+    model.load_state_dict(state_dict)
+    return model(in_indices)
 
 
 def run_rmsnorm(
