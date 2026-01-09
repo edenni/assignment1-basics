@@ -77,7 +77,7 @@ def _one_step(
 
 
 def train_bpe(
-    input_path: str, vocab_size: int, special_tokens: list[str]
+    input_path: str, vocab_size: int, special_tokens: list[str], num_processes: int = 1
 ) -> tuple[dict[int, bytes], list[tuple[bytes, bytes]]]:
     # init vocab
     vocab: dict[int, bytes] = {i: bytes([i]) for i in range(256)}
@@ -85,7 +85,7 @@ def train_bpe(
         vocab[i + 256] = token.encode("utf-8")
 
     # pre-tokenization
-    pre_token_counts = pretokenize(input_path, 1)
+    pre_token_counts = pretokenize(input_path, num_processes, special_tokens)
     pre_token_counts: dict[tuple[bytes], int] = {
         tuple(bytes([b]) for b in k.encode("utf8")): v for k, v in pre_token_counts.items()
     }

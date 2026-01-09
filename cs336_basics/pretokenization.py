@@ -1,6 +1,6 @@
+import concurrent.futures
 import os
-from collections import defaultdict
-from collections.abc import Callable
+from collections import Counter, defaultdict
 from typing import BinaryIO
 
 import regex as re
@@ -61,28 +61,37 @@ def simple_splitter(chunk: str):
         yield match.group()
 
 
+def _pretokenize(input_path, start, end):
+    counter = Counter()
+    with open(input_path, "rb") as f:
+        f.seek(start)
+        chunk = f.read(end - start).decode("utf-8", errors="ignore")
+
+    # Run pre-tokenization on your chunk and store the counts for each pre-token
+    mini_chunks = chunk.split("<|endoftext|>")
+
+    for mini_chunk in mini_chunks:
+        for pretoken in simple_splitter(mini_chunk):
+            counter[pretoken] += 1
+    return counter
+
+
 def pretokenize(
     input_path: str,
     num_processes: int = 4,
-    special_token: str = "<|endoftext|>",
-    splitter: Callable = simple_splitter,
+    special_tokens: list[str] = ["<|endoftext|>"],
 ) -> dict[str, int]:
     """Pre-tokenize the corpus, split by special token and return the counts of pre-tokens."""
     with open(input_path, "rb") as f:
-        boundaries = find_chunk_boundaries(f, num_processes * 4, special_token.encode("utf8"))
+        boundaries = find_chunk_boundaries(f, num_processes * 4, b"<|endoftext|>")
 
     if num_processes > 1:
-        raise NotImplementedError("Multi-processing is not yet supported for pre-tokenization.")
+        args = [(input_path, start, end) for start, end in zip(boundaries[:-1], boundaries[1:])]
+        with concurrent.futures.ProcessPoolExecutor(max_workers=num_processes) as executor:
+            counters = executor.map(_pretokenize, *zip(*args))
+        counter = sum(counters, Counter())
     else:
-        counter = defaultdict(int)
+        counter = Counter()
         for start, end in zip(boundaries[:-1], boundaries[1:]):
-            with open(input_path, "rb") as f:
-                f.seek(start)
-                chunk = f.read(end - start).decode("utf-8", errors="ignore")
-
-            # Run pre-tokenization on your chunk and store the counts for each pre-token
-            mini_chunks = chunk.split(special_token)
-            for mini_chunk in mini_chunks:
-                for pretoken in splitter(mini_chunk):
-                    counter[pretoken] += 1
+            counter.update(_pretokenize(input_path, start, end))
     return counter
