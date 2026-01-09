@@ -30,13 +30,15 @@ def merge(
     merged_token = left + right
 
     for tokens, count in pre_token_counts.copy().items():
-        new_tokens = []
         updated = False
-        i = 0
+        i = j = 0
+        len_tokens = len(tokens)
+        new_tokens = [None] * len_tokens  # avoid append
 
-        while i < len(tokens):
-            if i + 1 < len(tokens) and tokens[i] == left and tokens[i + 1] == right:
-                new_tokens.append(merged_token)
+        while i < len_tokens:
+            if i + 1 < len_tokens and tokens[i] == left and tokens[i + 1] == right:
+                # new_tokens.append(merged_token)
+                new_tokens[j] = merged_token
                 updated = True
 
                 # update pair counts
@@ -44,15 +46,17 @@ def merge(
                 if i > 0:
                     token_pair_counts[(tokens[i - 1], left)] -= count
                     token_pair_counts[(tokens[i - 1], merged_token)] += count
-                if i + 2 < len(tokens):
+                if i + 2 < len_tokens:
                     token_pair_counts[(right, tokens[i + 2])] -= count
                     token_pair_counts[(merged_token, tokens[i + 2])] += count
                 i += 2
             else:
-                new_tokens.append(tokens[i])
+                # new_tokens.append(tokens[i])
+                new_tokens[j] = tokens[i]
                 i += 1
+            j += 1
         if updated:
-            pre_token_counts[tuple(new_tokens)] = pre_token_counts.pop(tokens)
+            pre_token_counts[tuple(new_tokens[:j])] = pre_token_counts.pop(tokens)
     return pre_token_counts
 
 
