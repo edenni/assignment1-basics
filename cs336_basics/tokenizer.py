@@ -5,6 +5,7 @@ from tqdm import tqdm
 
 from cs336_basics.pretokenization import simple_splitter
 from cs336_basics.train_bpe import train_bpe
+from cs336_basics.utils import load_vocab_and_merges
 
 
 class Tokenizer:
@@ -25,8 +26,10 @@ class Tokenizer:
                     self.vocab[idx] = token_bytes
                     self.inv_vocab[token_bytes] = idx
 
-    def from_file(cls, vocab_filepath: str, merges_filepath: str, special_tokens: list[str] | None = None):
-        pass
+    @classmethod
+    def from_files(cls, vocab_filepath: str, merges_filepath: str, special_tokens: list[str] | None = None):
+        vocab, merges = load_vocab_and_merges(vocab_filepath, merges_filepath)
+        return cls(vocab, merges, special_tokens)
 
     def encode(self, text: str) -> list[int]:
         if self.special_tokens is not None:
@@ -35,7 +38,7 @@ class Tokenizer:
         else:
             chunks = [text]
         ids = []
-        for chunk in chunks:
+        for chunk in tqdm(chunks, desc="Encoding"):
             ids += self._encode_chunk(chunk)
         return ids
 
@@ -76,7 +79,7 @@ class Tokenizer:
         return encoded
 
     def encode_iterable(self, iterable: Iterable[str]) -> Iterator[int]:
-        for line in tqdm(iterable, desc="Encoding lines"):
+        for line in iterable:
             ids = self.encode(line)
             yield from ids
 

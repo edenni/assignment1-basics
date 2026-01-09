@@ -1,5 +1,6 @@
 import json
 import os
+import pickle
 from functools import lru_cache
 
 import torch
@@ -14,7 +15,7 @@ def gpt2_bytes_to_unicode():
     The reversible bpe codes work on unicode strings.
     This means you need a large # of unicode characters in your vocab if you want to avoid UNKs.
     When you're at something like a 10B token dataset you end up needing around 5K for decent coverage.
-    This is a signficant percentage of your normal, say, 32K bpe vocab.
+    This is a significant percentage of your normal, say, 32K bpe vocab.
     To avoid that, we want lookup tables between utf-8 bytes and unicode strings.
     And avoids mapping to whitespace/control characters the bpe code barfs on.
     """
@@ -30,7 +31,7 @@ def gpt2_bytes_to_unicode():
     return dict(zip(bs, cs))
 
 
-def get_tokenizer_from_vocab_merges_path(vocab_path: str | os.PathLike, merges_path: str | os.PathLike):
+def load_vocab_and_merges(vocab_path: str | os.PathLike, merges_path: str | os.PathLike):
     gpt2_byte_decoder = {v: k for k, v in gpt2_bytes_to_unicode().items()}
     with open(vocab_path) as vocab_f:
         gpt2_vocab = json.load(vocab_f)
@@ -58,7 +59,9 @@ def get_tokenizer_from_vocab_merges_path(vocab_path: str | os.PathLike, merges_p
     return vocab, merges
 
 
-def save_voacb_and_merge(vocab: dict[int, bytes], merges: list[tuple[bytes, bytes]], vocab_path: str, merges_path: str):
+def save_vocab_and_merges(
+    vocab: dict[int, bytes], merges: list[tuple[bytes, bytes]], vocab_path: str, merges_path: str
+):
     byte_to_unicode = gpt2_bytes_to_unicode()
 
     # Reverse the mapping from unicode characters to bytes
@@ -81,6 +84,21 @@ def save_voacb_and_merge(vocab: dict[int, bytes], merges: list[tuple[bytes, byte
     with open(merges_path, "w", encoding="utf-8") as f:
         for merge in reversed_merges:
             f.write(merge + "\n")
+
+
+# def save_vocab_and_merges(vocab, merges, vocab_path, merges_path):
+#     with open(vocab_path, "wb") as f:
+#         pickle.dump(vocab, f)
+#     with open(merges_path, "wb") as f:
+#         pickle.dump(merges, f)
+
+
+# def load_vocab_and_merges(vocab_path, merges_path):
+#     with open(vocab_path, "rb") as f:
+#         vocab = pickle.load(f)
+#     with open(merges_path, "rb") as f:
+#         merges = pickle.load(f)
+#     return vocab, merges
 
 
 def save_checkpoint(model, optimizer, iteration, out):
