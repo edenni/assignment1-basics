@@ -65,7 +65,7 @@ def save_vocab_and_merges(
     byte_to_unicode = gpt2_bytes_to_unicode()
 
     # Reverse the mapping from unicode characters to bytes
-    unicode_to_byte = {v: k for k, v in byte_to_unicode.items()}
+    # unicode_to_byte = {v: k for k, v in byte_to_unicode.items()}
 
     # Convert the byte tokens in the vocab back to string tokens using the unicode mapping
     reversed_vocab = {"".join([byte_to_unicode[b] for b in bytes_token]): k for k, bytes_token in vocab.items()}
