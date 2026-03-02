@@ -88,6 +88,10 @@ class Tokenizer:
         tokens = b"".join(tokens)
         return tokens.decode("utf-8", errors="replace")
 
+    @property
+    def vocab_size(self) -> int:
+        return len(self.vocab)
+
 
 if __name__ == "__main__":
     input_path = "./data/TinyStoriesV2-GPT4-valid.txt"

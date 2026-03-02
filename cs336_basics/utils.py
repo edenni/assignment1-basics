@@ -1,9 +1,9 @@
 import json
 import os
-import pickle
 from functools import lru_cache
 
 import torch
+from models import softmax
 
 
 @lru_cache
@@ -117,3 +117,35 @@ def load_checkpoint(src, model, optimizer):
     model.load_state_dict(state_dict["model"])
     optimizer.load_state_dict(state_dict["optimizer"])
     return state_dict["iteration"]
+
+
+def generate(
+    prompt,
+    model,
+    tokenizer,
+    top_p: float = 1.0,
+    t: float = 1.0,
+    max_steps: int = 32,
+    eos_token: str = "<|endoftext|>",
+    device=None,
+):
+    eos_token_id = tokenizer.inv_vocab[eos_token.encode("utf-8")]
+    prompt = torch.Tensor(tokenizer.encode(prompt)).long().unsqueeze(0)
+    if device is not None:
+        prompt = prompt.to(device)
+
+    seq = model.generate(prompt, eos_token_id, top_p=top_p, t=t, max_steps=max_steps)
+    return seq
+
+
+if __name__ == "__main__":
+    from models import Transformer
+    from tokenizer import Tokenizer
+
+    tokenizer = Tokenizer.from_files("outputs/tinystories_vocab.json", "outputs/tinystories_merges.txt")
+    model = Transformer(
+        num_layers=2, vocab_size=tokenizer.vocab_size, context_length=128, d_model=64, num_heads=4, d_ff=256
+    )
+
+    pred = generate("Once upon a time", model, tokenizer, top_p=0.9, t=1.0, max_steps=16)
+    print(tokenizer.decode(pred.tolist()[0]))

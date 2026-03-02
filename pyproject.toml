@@ -14,8 +14,9 @@ dependencies = [
     "regex>=2024.11.6", # more powerful regex than the builtin `re` module
     "submitit>=1.5.2", # job submission for SLURM
     "tiktoken>=0.9.0",
-    "torch~=2.6.0; sys_platform != 'darwin' or platform_machine != 'x86_64'",
-    "torch~=2.2.2; sys_platform == 'darwin' and platform_machine == 'x86_64'", # Intel Macs
+    # "torch~=2.6.0; sys_platform != 'darwin' or platform_machine != 'x86_64'",
+    # "torch~=2.2.2; sys_platform == 'darwin' and platform_machine == 'x86_64'", # Intel Macs
+    "torch>=2.7.1",
     "tqdm>=4.67.1",
     "wandb>=0.19.7",
     "ty>=0.0.1a16",
@@ -29,6 +30,16 @@ build-backend = "uv_build"
 [tool.uv.build-backend]
 module-name = "cs336_basics"
 module-root = ""
+
+[tool.uv.sources]
+torch = [
+    { index = "pytorch-cu128", marker = "sys_platform == 'linux'" },
+]
+
+[[tool.uv.index]]
+name = "pytorch-cu128"
+url = "https://download.pytorch.org/whl/cu128"
+explicit = true
 
 [tool.uv]
 package = true
@@ -49,6 +60,7 @@ line-length = 120
 [dependency-groups]
 dev = [
     "ipykernel>=7.1.0",
+    "nvitop>=1.6.2",
     "py-spy>=0.4.1",
 ]
 

@@ -6,8 +6,9 @@ import torch
 from dataset import Dataset
 from models import Transformer, cross_entropy
 from optimizer import AdamW, clip_grad_norm, get_cosine_lr
+from tokenizer import Tokenizer
 from transformers import HfArgumentParser
-from utils import load_checkpoint, save_checkpoint
+from utils import generate, load_checkpoint, save_checkpoint
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s - %(levelname)s - %(message)s")
 
@@ -46,6 +47,7 @@ class TrainingConfig:
     log_interval: int | None = field(default=None)
     eval_interval: int | None = field(default=None)
     eval_iters: int | None = field(default=100)
+    gen_iters: int | None = field(default=500)
 
     # ablation studies
     no_rmsnorm: bool | None = field(default=False)
@@ -74,10 +76,11 @@ if config.wandb_logging:
     wandb.init(project=config.wandb_project, name=config.wandb_run_name)
 logging.info(f"Training with config: {asdict(config)}")
 
+tokenizer = Tokenizer.from_files("outputs/tinystories_vocab.json", "outputs/tinystories_merges.txt")
 dataset = Dataset(config.dataset_name, config.context_length, config.batch_size, device=config.device)
 model = Transformer(
     num_layers=config.num_layers,
-    vocab_size=config.vocab_size,
+    vocab_size=tokenizer.vocab_size,
     context_length=config.context_length,
     d_model=config.d_model,
     num_heads=config.num_heads,
@@ -124,14 +127,17 @@ while iter_num < config.total_iters:
     optimizer.step()
     finish_time = time.time()
 
-    # logging
     if iter_num % config.log_interval == 0:
         logging.info(
             f"Iter: {iter_num}, Train loss: {loss.item():.4f}, LR: {lr:.6f}, Time: {1000 * (finish_time - curr_time):.2f}ms"
         )
-    # evaluation
     if iter_num % config.eval_interval == 0:
         eval()
+    if iter_num % config.gen_iters == 0:
+        prompt = "Once upon a time"
+        gen_seq = generate(prompt, model, tokenizer, top_p=0.9, t=1.0, max_steps=100, device=config.device)
+        gen_text = tokenizer.decode(gen_seq.tolist()[0])
+        logging.info(f"Iter: {iter_num}, Prompt: {prompt}, Generated: {gen_text}")
 
     curr_time = finish_time
     iter_num += 1

@@ -3,6 +3,7 @@ import math
 import torch
 import torch.nn as nn
 from einops import rearrange, repeat
+from torchgen import model
 
 
 class Linear(nn.Module):
@@ -111,8 +112,10 @@ class RotaryPositionalEmbedding(nn.Module):
         return x.type(in_dtype)
 
 
-def softmax(x, dim=-1):
+def softmax(x, dim=-1, t=1.0):
     o = x - x.max(dim=dim, keepdim=True)[0]
+    assert t > 0, "temperature must be greater than 0"
+    o /= t
     return o.exp() / o.exp().sum(dim=dim, keepdim=True)
 
 
@@ -214,6 +217,37 @@ class Transformer(nn.Module):
         x = self.ln_final(x)
         x = self.lm_head(x)
         return x
+
+    def generate(
+        self,
+        prompt,
+        eos_token_id: int,
+        top_p: float = 1.0,
+        t: float = 1.0,
+        max_steps: int = 32,
+    ):
+        input_seq = prompt
+        with torch.inference_mode():
+            for _ in range(max_steps):
+                logits = self.forward(input_seq)
+                if t == 0:
+                    out = torch.argmax(logits[:, -1, :], dim=-1, keepdim=True)
+                else:
+                    # nucleus sampling
+                    probs = softmax(logits, dim=-1, t=t)[:, -1, :]
+                    if top_p < 1.0:
+                        sorted_values, sorted_idx = probs.sort(-1, descending=True)
+                        mask = sorted_values.cumsum(-1) <= top_p
+                        mask[:, 0] = True  # ensure at least one token is kept
+                        orig_mask = mask.gather(-1, sorted_idx.argsort(-1))
+                        for i in range(len(probs)):
+                            probs[i].masked_fill_(~orig_mask[i], 0.0)
+                            probs[i] /= probs[i].sum(-1)
+                    out = torch.multinomial(probs, 1)
+                input_seq = torch.cat([input_seq, out], dim=-1)
+                if (out[-1:] == eos_token_id).all(dim=-1).item():
+                    break
+        return input_seq
 
 
 def cross_entropy(inputs, targets):
