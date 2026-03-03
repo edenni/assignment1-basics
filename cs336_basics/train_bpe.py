@@ -25,38 +25,39 @@ def merge(
     token_pair_counts: dict[tuple[bytes, bytes], int],
     tokens_to_merge: tuple[bytes, bytes],
 ) -> dict[tuple[bytes], int]:
-    """Merge the token pair with max count."""
+
     left, right = tokens_to_merge
     merged_token = left + right
 
-    for tokens, count in pre_token_counts.copy().items():
-        updated = False
-        i = j = 0
+    for tokens, count in list(pre_token_counts.items()):
         len_tokens = len(tokens)
-        new_tokens = [None] * len_tokens  # avoid append
+        old_len = len_tokens - 1
+        new_tokens = [None] * len_tokens
+        i = j = 0
+        updated = False
 
         while i < len_tokens:
             if i + 1 < len_tokens and tokens[i] == left and tokens[i + 1] == right:
-                # new_tokens.append(merged_token)
                 new_tokens[j] = merged_token
-                updated = True
-
-                # update pair counts
-                token_pair_counts[tokens_to_merge] -= count
-                if i > 0:
-                    token_pair_counts[(tokens[i - 1], left)] -= count
-                    token_pair_counts[(tokens[i - 1], merged_token)] += count
-                if i + 2 < len_tokens:
-                    token_pair_counts[(right, tokens[i + 2])] -= count
-                    token_pair_counts[(merged_token, tokens[i + 2])] += count
                 i += 2
+                updated = True
             else:
-                # new_tokens.append(tokens[i])
                 new_tokens[j] = tokens[i]
                 i += 1
             j += 1
-        if updated:
-            pre_token_counts[tuple(new_tokens[:j])] = pre_token_counts.pop(tokens)
+
+        if not updated:
+            continue
+
+        new_tokens = tuple(new_tokens[:j])
+        for k in range(old_len):
+            token_pair_counts[(tokens[k], tokens[k + 1])] -= count
+        for k in range(len(new_tokens) - 1):
+            token_pair_counts[(new_tokens[k], new_tokens[k + 1])] += count
+        pre_token_counts[new_tokens] = pre_token_counts.pop(tokens)
+
+    token_pair_counts.pop(tokens_to_merge, None)
+
     return pre_token_counts
 
 
@@ -104,4 +105,7 @@ def train_bpe(
 
 
 if __name__ == "__main__":
-    train_bpe("./data/TinyStoriesV2-GPT4-valid.txt", 258, ["<|endoftext|>"])
+    vocab, merges = train_bpe("./data/TinyStoriesV2-GPT4-valid.txt", 2000, ["<|endoftext|>"])
+    # print(merges[1000:1100])
+    # vocab_list = sorted(vocab.items(), key=lambda x: x[0])
+    # print(vocab_list[1000:1100])

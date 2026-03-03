@@ -4,8 +4,8 @@ from cs336_basics.train_bpe import train_bpe
 from cs336_basics.utils import save_vocab_and_merges
 
 input_path = "data/TinyStoriesV2-GPT4-train.txt"
-output_vocab_path = "outputs/tinystories_vocab.plk"
-output_merge_path = "outputs/tinystories_merges.plk"
+output_vocab_path = "outputs/tinystories_vocab.json"
+output_merge_path = "outputs/tinystories_merges.txt"
 
 vocab_size = 10000
 special_tokens = ["<|endoftext|>"]

@@ -3,7 +3,6 @@ import os
 from functools import lru_cache
 
 import torch
-from models import softmax
 
 
 @lru_cache
