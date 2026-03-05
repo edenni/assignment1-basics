@@ -4,11 +4,13 @@ from dataclasses import asdict, dataclass, field
 
 import torch
 from dataset import Dataset
-from models import Transformer, cross_entropy
 from optimizer import AdamW, clip_grad_norm, get_cosine_lr
 from tokenizer import Tokenizer
 from transformers import HfArgumentParser
 from utils import generate, load_checkpoint, save_checkpoint
+
+import wandb
+from cs336_basics.model import Transformer, cross_entropy
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s - %(levelname)s - %(message)s")
 
@@ -29,8 +31,9 @@ class TrainingConfig:
     d_model: int | None = field(default=768)
     num_heads: int | None = field(default=12)
     d_ff: int | None = field(default=3072)
-    attn_pdrop: float | None = field(default=0.1)
-    resid_pdrop: float | None = field(default=0.1)
+    dropout: float | None = field(default=0.1)
+    # attn_pdrop: float | None = field(default=0.1)
+    # resid_pdrop: float | None = field(default=0.1)
     init_from: str = field(default="scratch")
 
     # training parameters (additional adamW parameter use as default)
@@ -42,17 +45,17 @@ class TrainingConfig:
 
     # logging parameters
     wandb_logging: bool | None = field(default=False)
-    wandb_project: str | None = field(default=None)
-    wandb_run_name: str | None = field(default=None)
+    wandb_project: str | None = field(default="cs336")
+    wandb_run_name: str | None = field(default="gpt")
     log_interval: int | None = field(default=None)
     eval_interval: int | None = field(default=None)
     eval_iters: int | None = field(default=100)
     gen_iters: int | None = field(default=500)
 
     # ablation studies
-    no_rmsnorm: bool | None = field(default=False)
-    parallel_layers: bool | None = field(default=False)
-    post_norm: bool | None = field(default=False)
+    # no_rmsnorm: bool | None = field(default=False)
+    # parallel_layers: bool | None = field(default=False)
+    # post_norm: bool | None = field(default=False)
 
     def __post_init__(self):
         if self.warmup_iters is None:
@@ -64,7 +67,7 @@ class TrainingConfig:
         if self.wandb_logging:
             assert self.wandb_project is not None, "wandb_project must be provided if wandb_logging is True"
             assert self.wandb_run_name is not None, "wandb_run_name must be provided if wandb_logging is True"
-        self.ablation = self.no_rmsnorm or self.parallel_layers or self.post_norm
+        # self.ablation = self.no_rmsnorm or self.parallel_layers or self.post_norm
 
 
 # parsing config
@@ -77,10 +80,11 @@ if config.wandb_logging:
 logging.info(f"Training with config: {asdict(config)}")
 
 tokenizer = Tokenizer.from_files("outputs/tinystories_vocab.json", "outputs/tinystories_merges.txt")
+config.vocab_size = tokenizer.vocab_size
 dataset = Dataset(config.dataset_name, config.context_length, config.batch_size, device=config.device)
 model = Transformer(
     num_layers=config.num_layers,
-    vocab_size=tokenizer.vocab_size,
+    vocab_size=config.vocab_size,
     context_length=config.context_length,
     d_model=config.d_model,
     num_heads=config.num_heads,
@@ -91,11 +95,12 @@ model.to(config.device)
 optimizer = AdamW(model.parameters(), lr=config.lr_max, weight_decay=config.weight_decay)
 
 if config.init_from != "scratch":
-    ckpt_dir = f"data/out/checkpoints/{config.init_from}"
+    ckpt_dir = f"outputs/checkpoints/{config.init_from}"
     iter_num = load_checkpoint(model, optimizer, ckpt_dir)
 
 
 def eval():
+    model.eval()
     total_loss = 0
     for _ in range(config.eval_iters):
         x, y = dataset.get_batch("val")
@@ -107,9 +112,14 @@ def eval():
     total_loss /= config.eval_iters
     logging.info(f"Iter: {iter_num}, Val loss: {loss.item():.4f}, LR: {lr:.6f}")
     if config.wandb_logging:
-        wandb.log({"val_loss": total_loss, "lr": lr, "iter": iter_num})
-        save_checkpoint(model, optimizer, iter_num, f"data/out/checkpoints/{config.wandb_run_name}.pt")
+        wandb.log({"val/loss": total_loss, "lr": lr, "step": iter_num})
+        save_checkpoint(model, optimizer, iter_num, f"outputs/checkpoints/{config.wandb_run_name}.pt")
+    model.train()
 
+
+if config.wandb_logging:
+    wandb.init(project=config.wandb_project, name=config.wandb_run_name)
+    wandb.config.update(asdict(config))
 
 iter_num = 0
 curr_time = time.time()
@@ -131,6 +141,8 @@ while iter_num < config.total_iters:
         logging.info(
             f"Iter: {iter_num}, Train loss: {loss.item():.4f}, LR: {lr:.6f}, Time: {1000 * (finish_time - curr_time):.2f}ms"
         )
+        if config.wandb_logging:
+            wandb.log({"train/loss": loss.item(), "lr": lr, "step": iter_num})
     if iter_num % config.eval_interval == 0:
         eval()
     if iter_num % config.gen_iters == 0:

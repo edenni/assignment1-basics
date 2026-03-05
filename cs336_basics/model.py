@@ -3,7 +3,6 @@ import math
 import torch
 import torch.nn as nn
 from einops import rearrange, repeat
-from torchgen import model
 
 
 class Linear(nn.Module):
@@ -83,6 +82,23 @@ class SwiGLU(nn.Module):
             nn.init.trunc_normal_(w, std=std, a=-3 * std, b=3 * std)
 
 
+def dropout_fn(x, p: float):
+    mask = torch.bernoulli(torch.ones_like(x) * (1 - p))
+    return x * mask / (1 - p)
+
+
+class Dropout(nn.Module):
+    def __init__(self, p: float):
+        super().__init__()
+        assert 0 <= p < 1
+        self.p = p
+
+    def forward(self, x):
+        if self.training:
+            x = dropout_fn(x, self.p)
+        return x
+
+
 def rotate_pair(x):
     x = rearrange(x, "... (d r) -> ... d r", r=2)
     x1, x2 = x.unbind(dim=-1)
@@ -119,15 +135,18 @@ def softmax(x, dim=-1, t=1.0):
     return o.exp() / o.exp().sum(dim=dim, keepdim=True)
 
 
-def scaled_dot_product_attention(q, k, v, mask=None):
+def scaled_dot_product_attention(q, k, v, mask=None, dropout=0.0):
     att = (q @ k.transpose(-2, -1)) * (1.0 / math.sqrt(k.size(-1)))
     if mask is not None:
         att.masked_fill_(~mask, float("-inf"))
-    return softmax(att) @ v
+    att = softmax(att)
+    if dropout:
+        att = dropout_fn(att, dropout)
+    return att @ v
 
 
 class MultiHeadSelfAttention(nn.Module):
-    def __init__(self, d_model, num_heads, theta=10000, max_seq_len=8192, device=None, dtype=None):
+    def __init__(self, d_model, num_heads, theta=10000, max_seq_len=8192, dropout=0.1, device=None, dtype=None):
         super().__init__()
         assert d_model % num_heads == 0
         self.d_model = d_model
@@ -139,6 +158,7 @@ class MultiHeadSelfAttention(nn.Module):
             self.rope = RotaryPositionalEmbedding(theta, d_model // num_heads, max_seq_len, device=device)
         else:
             self.rope = None
+        self.dropout = dropout
 
     def forward(self, x, token_positions=None):
         B, L, D = x.size()
@@ -153,7 +173,7 @@ class MultiHeadSelfAttention(nn.Module):
             k = self.rope(k, token_positions)
 
         mask = torch.tril(torch.ones(L, L, device=q.device)).unsqueeze(0).bool()
-        y = scaled_dot_product_attention(q, k, v, mask)
+        y = scaled_dot_product_attention(q, k, v, mask, self.training and self.dropout)
         y = y.transpose(1, 2).contiguous().view(B, L, D)
         o = self.o_proj(y)
         return o
@@ -167,21 +187,26 @@ class TransformerBlock(nn.Module):
         d_ff: int,
         max_seq_len: int,
         theta: float,
+        dropout: float = 0.1,
         device=None,
         dtype=None,
     ):
         super().__init__()
-        self.attn = MultiHeadSelfAttention(d_model, num_heads, theta, max_seq_len, device=device, dtype=dtype)
+        self.attn = MultiHeadSelfAttention(d_model, num_heads, theta, max_seq_len, dropout, device=device, dtype=dtype)
         self.ln1 = RMSNorm(d_model, device=device, dtype=dtype)
         self.ln2 = RMSNorm(d_model, device=device, dtype=dtype)
         self.ffn = SwiGLU(d_model, d_ff, device=device, dtype=dtype)
+        self.do1 = Dropout(dropout)
+        self.do2 = Dropout(dropout)
 
     def forward(self, x):
         y = self.ln1(x)
         y = self.attn(y)
+        y = self.do1(y)
         x = x + y
         y = self.ln2(x)
         y = self.ffn(y)
+        y = self.do2(y)
         x = x + y
         return x
 
@@ -196,6 +221,7 @@ class Transformer(nn.Module):
         num_heads: int,
         d_ff: int,
         theta: float = 10_000,
+        dropout: float = 0.1,
         device=None,
         dtype=None,
     ):
@@ -203,7 +229,7 @@ class Transformer(nn.Module):
         self.token_embeddings = Embedding(vocab_size, d_model, device=device, dtype=dtype)
         self.layers = nn.ModuleList(
             [
-                TransformerBlock(d_model, num_heads, d_ff, context_length, theta, device=device, dtype=dtype)
+                TransformerBlock(d_model, num_heads, d_ff, context_length, theta, dropout, device=device, dtype=dtype)
                 for _ in range(num_layers)
             ]
         )
