@@ -89,6 +89,7 @@ model = Transformer(
     d_model=config.d_model,
     num_heads=config.num_heads,
     d_ff=config.d_ff,
+    dropout=config.dropout,
     device=config.device,
 )
 model.to(config.device)
