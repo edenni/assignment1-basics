@@ -138,7 +138,7 @@ def generate(
 
 
 if __name__ == "__main__":
-    from models import Transformer
+    from cs336_basics.model import Transformer
     from tokenizer import Tokenizer
 
     tokenizer = Tokenizer.from_files("outputs/tinystories_vocab.json", "outputs/tinystories_merges.txt")

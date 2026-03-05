@@ -28,7 +28,7 @@ def run_linear(
     Returns:
         Float[Tensor, "... d_out"]: The transformed output of your linear module.
     """
-    from cs336_basics.models import Linear
+    from cs336_basics.model import Linear
 
     model = Linear(d_in, d_out)
     model.load_state_dict({"weight": weights})
@@ -53,7 +53,7 @@ def run_embedding(
     Returns:
         Float[Tensor, "... d_model"]: Batch of embeddings returned by your Embedding layer.
     """
-    from cs336_basics.models import Embedding
+    from cs336_basics.model import Embedding
 
     model = Embedding(vocab_size, d_model)
     model.load_state_dict({"embed": weights})
@@ -89,7 +89,7 @@ def run_swiglu(
     # swiglu.w1.weight.data = w1_weight
     # swiglu.w2.weight.data = w2_weight
     # swiglu.w3.weight.data = w3_weight
-    from cs336_basics.models import SwiGLU
+    from cs336_basics.model import SwiGLU
 
     model = SwiGLU(d_model, d_ff)
     model.load_state_dict({"w1": w1_weight, "w2": w2_weight, "w3": w3_weight})
@@ -114,7 +114,7 @@ def run_scaled_dot_product_attention(
     Returns:
         Float[Tensor, " ... queries d_v"]: Output of SDPA
     """
-    from cs336_basics.models import scaled_dot_product_attention
+    from cs336_basics.model import scaled_dot_product_attention
 
     return scaled_dot_product_attention(Q, K, V, mask)
 
@@ -150,7 +150,7 @@ def run_multihead_self_attention(
         Float[Tensor, " ... sequence_length d_out"]: Tensor with the output of running your optimized, batched multi-headed attention
         implementation with the given QKV projection weights and input features.
     """
-    from cs336_basics.models import MultiHeadSelfAttention
+    from cs336_basics.model import MultiHeadSelfAttention
 
     model = MultiHeadSelfAttention(d_model, num_heads, theta=-1)
     model.load_state_dict(
@@ -199,7 +199,7 @@ def run_multihead_self_attention_with_rope(
         Float[Tensor, " ... sequence_length d_out"]: Tensor with the output of running your optimized, batched multi-headed attention
         implementation with the given QKV projection weights and input features.
     """
-    from cs336_basics.models import MultiHeadSelfAttention
+    from cs336_basics.model import MultiHeadSelfAttention
 
     model = MultiHeadSelfAttention(d_model, num_heads, theta=theta, max_seq_len=max_seq_len)
     model.load_state_dict(
@@ -230,7 +230,7 @@ def run_rope(
     Returns:
         Float[Tensor, " ... sequence_length d_k"]: Tensor with RoPEd input.
     """
-    from cs336_basics.models import RotaryPositionalEmbedding
+    from cs336_basics.model import RotaryPositionalEmbedding
 
     model = RotaryPositionalEmbedding(theta, d_k, max_seq_len)
     return model(in_query_or_key, token_positions)
@@ -306,7 +306,7 @@ def run_transformer_block(
         Float[Tensor, "batch sequence_length d_model"] Tensor with the output of
         running the Transformer block on the input features while using RoPE.
     """
-    from cs336_basics.models import TransformerBlock
+    from cs336_basics.model import TransformerBlock
 
     block = TransformerBlock(d_model, num_heads, d_ff, max_seq_len, theta)
     block.load_state_dict(
@@ -410,7 +410,7 @@ def run_transformer_lm(
         Float[Tensor, "batch_size sequence_length vocab_size"]: Tensor with the predicted unnormalized
         next-word distribution for each token.
     """
-    from cs336_basics.models import Transformer
+    from cs336_basics.model import Transformer
 
     model = Transformer(num_layers, vocab_size, context_length, d_model, num_heads, d_ff, theta=rope_theta)
 
@@ -463,7 +463,7 @@ def run_rmsnorm(
         Float[Tensor,"... d_model"]: Tensor of with the same shape as `in_features` with the output of running
         RMSNorm of the `in_features`.
     """
-    from cs336_basics.models import RMSNorm
+    from cs336_basics.model import RMSNorm
 
     model = RMSNorm(d_model, eps)
     model.load_state_dict({"gain": weights})
@@ -481,7 +481,7 @@ def run_silu(in_features: Float[Tensor, " ..."]) -> Float[Tensor, " ..."]:
         Float[Tensor,"..."]: of with the same shape as `in_features` with the output of applying
         SiLU to each element.
     """
-    from cs336_basics.models import Swish
+    from cs336_basics.model import Swish
 
     return Swish()(in_features)
 
@@ -524,7 +524,7 @@ def run_softmax(in_features: Float[Tensor, " ..."], dim: int) -> Float[Tensor, "
         Float[Tensor, "..."]: Tensor of with the same shape as `in_features` with the output of
         softmax normalizing the specified `dim`.
     """
-    from cs336_basics.models import softmax
+    from cs336_basics.model import softmax
 
     return softmax(in_features, dim=dim)
 
@@ -544,7 +544,7 @@ def run_cross_entropy(
     Returns:
         Float[Tensor, ""]: The average cross-entropy loss across examples.
     """
-    from cs336_basics.models import cross_entropy
+    from cs336_basics.model import cross_entropy
 
     return cross_entropy(inputs, targets)
 
