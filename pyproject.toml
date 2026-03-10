@@ -23,6 +23,7 @@ dependencies = [
     "transformers>=5.2.0",
     "matplotlib",
     "ty>=0.0.1a16",
+    "triton>=3.6.0",
 ]
 
 [build-system]

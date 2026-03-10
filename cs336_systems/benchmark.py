@@ -84,10 +84,18 @@ model = Transformer(
     device=config.device,
 )
 model.to(config.device)
+# model = torch.compile(model)
 optimizer = AdamW(model.parameters(), lr=config.lr_max, weight_decay=config.weight_decay)
 
-forward_times = []
-backward_times = []
+warm_up_iters = 5
+
+for _ in range(warm_up_iters):
+    x, y = dataset.get_batch("train")
+    with torch.autocast(device_type="cuda", dtype=torch.bfloat16):
+        logits = model(x)
+        loss = cross_entropy(logits, y)
+        loss.backward()
+        optimizer.step()
 
 for iter_num in tqdm(range(config.total_iters)):
     optimizer.zero_grad()
@@ -95,24 +103,14 @@ for iter_num in tqdm(range(config.total_iters)):
     optimizer.set_lr(lr)
     x, y = dataset.get_batch("train")
 
-    start_time = timeit.default_timer()
-    logits = model(x)
-    # torch.cuda.synchronize()
-    forward_time = timeit.default_timer() - start_time
-    forward_times.append(forward_time)
+    with torch.autocast(device_type="cuda", dtype=torch.bfloat16):
+        logits = model(x)
+        loss = cross_entropy(logits, y)
 
-    loss = cross_entropy(logits, y)
+        loss.backward()
+        clip_grad_norm(model.parameters(), 1.0)
+        optimizer.step()
 
-    start_time = timeit.default_timer()
-    loss.backward()
-    # torch.cuda.synchronize()
-    clip_grad_norm(model.parameters(), 1.0)
-    backward_time = timeit.default_timer() - start_time
-    backward_times.append(backward_time)
-    optimizer.step()
-
-forward_times.append(forward_time)
-backward_times.append(backward_time)
 
 # import matplotlib.pyplot as plt
 
