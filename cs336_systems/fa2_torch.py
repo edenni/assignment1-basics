@@ -1,9 +1,6 @@
-import timeit
-
 import torch
 import triton
 import triton.language as tl
-from einops import rearrange
 
 
 class FlashAttentionFunc(torch.autograd.Function):
@@ -137,12 +134,12 @@ def flash_fwd_kernel(
         k_tile = tl.load(K_block_ptr, boundary_check=(0, 1))  # [K_TILE_SIZE, D]
         v_tile = tl.load(V_block_ptr, boundary_check=(0, 1))  # [K_TILE_SIZE, D]
 
-        scores = tl.dot(q_tile, k_tile.T) * scale  # [Q_TILE_SIZE, K_TILE_SIZE]
+        scores = tl.dot(q_tile, tl.trans(k_tile), allow_tf32=False) * scale  # [Q_TILE_SIZE, K_TILE_SIZE]
         m_ij = tl.maximum(m_i, scores.max(axis=1))  # [Q_TILE_SIZE]
 
         exp_scores = tl.exp(scores - m_ij[:, None])  # [Q_TILE_SIZE, K_TILE_SIZE]
         l_i = tl.exp(m_i - m_ij) * l_i + tl.sum(exp_scores, axis=1)  # [Q_TILE_SIZE]
-        o_i = tl.exp(m_i - m_ij)[:, None] * o_i + tl.dot(exp_scores, v_tile)  # [Q_TILE_SIZE, D]
+        o_i = tl.exp(m_i - m_ij)[:, None] * o_i + tl.dot(exp_scores, v_tile, allow_tf32=False)  # [Q_TILE_SIZE, D]
         m_i = m_ij
 
         K_block_ptr = K_block_ptr.advance((K_TILE_SIZE, 0))
@@ -200,25 +197,25 @@ class TritonFlashAttnFunc(torch.autograd.Function):
         return out_final
 
 
-x = torch.randn(32, 256, 128, device="cuda", dtype=torch.float32)
-output = TritonFlashAttnFunc.apply(x, x, x)
-actual = torch.nn.functional.scaled_dot_product_attention(x, x, x)
-torch.testing.assert_close(output, actual, atol=1e-5, rtol=1e-5)
+if __name__ == "__main__":
+    x = torch.randn(4, 32, 128, device="cuda", dtype=torch.float32)
+    output = TritonFlashAttnFunc.apply(x, x, x)
+    actual = torch.nn.functional.scaled_dot_product_attention(x, x, x)
+    torch.testing.assert_close(output, actual, atol=1e-5, rtol=1e-5)
 
+    # output = FlashAttentionFunc.apply(x, x, x)
+    # actual = torch.nn.functional.scaled_dot_product_attention(x, x, x)
+    # torch.testing.assert_close(output, actual, atol=1e-5, rtol=1e-5)
 
-# output = FlashAttentionFunc.apply(x, x, x)
-# actual = torch.nn.functional.scaled_dot_product_attention(x, x, x)
-# torch.testing.assert_close(output, actual, atol=1e-5, rtol=1e-5)
-
-# custom_time = timeit.timeit(
-#     "FlashAttentionFunc.apply(x, x, x)",
-#     globals=globals(),
-#     number=100,
-# )
-# torch_time = timeit.timeit(
-#     "torch.nn.functional.scaled_dot_product_attention(x, x, x)",
-#     globals=globals(),
-#     number=100,
-# )
-# print(f"Custom FlashAttention time: {custom_time:.4f} seconds")
-# print(f"PyTorch FlashAttention time: {torch_time:.4f} seconds")
+    # custom_time = timeit.timeit(
+    #     "FlashAttentionFunc.apply(x, x, x)",
+    #     globals=globals(),
+    #     number=100,
+    # )
+    # torch_time = timeit.timeit(
+    #     "torch.nn.functional.scaled_dot_product_attention(x, x, x)",
+    #     globals=globals(),
+    #     number=100,
+    # )
+    # print(f"Custom FlashAttention time: {custom_time:.4f} seconds")
+    # print(f"PyTorch FlashAttention time: {torch_time:.4f} seconds")
