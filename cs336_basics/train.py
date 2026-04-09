@@ -1,11 +1,13 @@
 import logging
 import time
+from contextlib import nullcontext
 from dataclasses import asdict, dataclass, field
 
 import torch
 from dataset import Dataset
 from optimizer import AdamW, clip_grad_norm, get_cosine_lr
 from tokenizer import Tokenizer
+from torch import autocast
 from transformers import HfArgumentParser
 from utils import generate, load_checkpoint, save_checkpoint
 
@@ -42,6 +44,7 @@ class TrainingConfig:
     lr_max: float | None = field(default=5e-4)
     lr_min: float | None = field(default=0)
     weight_decay: float | None = field(default=0.001)
+    precision: str | None = field(default="bf16" if torch.cuda.is_bf16_supported() else "fp32")
 
     # logging parameters
     wandb_logging: bool | None = field(default=False)
@@ -93,12 +96,13 @@ model = Transformer(
     device=config.device,
 )
 model.to(config.device)
+logging.info(f"Model size: {sum(p.numel() for p in model.parameters()) / 1e6:.2f}M")
 optimizer = AdamW(model.parameters(), lr=config.lr_max, weight_decay=config.weight_decay)
-
 if config.init_from != "scratch":
     ckpt_dir = f"outputs/checkpoints/{config.init_from}"
     iter_num = load_checkpoint(model, optimizer, ckpt_dir)
 
+cast_context = autocast(device_type=config.device, dtype=torch.bfloat16) if config.precision == "bf16" else nullcontext()
 
 def eval():
     model.eval()
@@ -107,8 +111,9 @@ def eval():
         x, y = dataset.get_batch("val")
         x, y = x.to(config.device), y.to(config.device)
         with torch.no_grad():
-            logits = model(x)
-            loss = cross_entropy(logits, y)
+            with cast_context:
+                logits = model(x)
+                loss = cross_entropy(logits, y)
             total_loss += loss.item()
     total_loss /= config.eval_iters
     logging.info(f"Iter: {iter_num}, Val loss: {loss.item():.4f}, LR: {lr:.6f}")
@@ -129,8 +134,9 @@ while iter_num < config.total_iters:
 
     # core backward pass
     x, y = dataset.get_batch("train")
-    logits = model(x)
-    loss = cross_entropy(logits, y)
+    with cast_context:
+        logits = model(x)
+        loss = cross_entropy(logits, y)
     loss.backward()
     clip_grad_norm(model.parameters(), 1.0)
     lr = get_cosine_lr(iter_num, config.lr_max, config.lr_min, config.warmup_iters, config.total_iters)
