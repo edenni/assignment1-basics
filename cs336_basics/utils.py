@@ -32,10 +32,10 @@ def gpt2_bytes_to_unicode():
 
 def load_vocab_and_merges(vocab_path: str | os.PathLike, merges_path: str | os.PathLike):
     gpt2_byte_decoder = {v: k for k, v in gpt2_bytes_to_unicode().items()}
-    with open(vocab_path) as vocab_f:
+    with open(vocab_path, encoding="utf-8") as vocab_f:
         gpt2_vocab = json.load(vocab_f)
     gpt2_bpe_merges = []
-    with open(merges_path) as f:
+    with open(merges_path, encoding="utf-8") as f:
         for line in f:
             cleaned_line = line.rstrip()
             if cleaned_line and len(cleaned_line.split(" ")) == 2:
@@ -101,6 +101,8 @@ def save_vocab_and_merges(
 
 
 def save_checkpoint(model, optimizer, iteration, out):
+    from pathlib import Path
+    Path(out).parent.mkdir(parents=True, exist_ok=True)
     torch.save(
         {
             "model": model.state_dict(),

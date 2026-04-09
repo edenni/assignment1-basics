@@ -1,3 +1,5 @@
+from pathlib import Path
+
 import numpy as np
 from tqdm import tqdm
 
@@ -8,11 +10,14 @@ vocab_filepath = "outputs/tinystories_vocab.json"
 merges_filepath = "outputs/tinystories_merges.txt"
 special_tokens = ["<|endoftext|>"]
 dataset_name = "tinystories"
+output_dir = "data/tinystories"
+
+Path(output_dir).mkdir(parents=True, exist_ok=True)
 
 tokenizer = Tokenizer.from_files(vocab_filepath, merges_filepath, special_tokens)
 
 for split in ["train", "val"]:
-    with open(data_path[split]) as f:
+    with open(data_path[split], encoding='utf-8') as f:
         text = f.read()
     encoded = tokenizer.encode(text)
 
