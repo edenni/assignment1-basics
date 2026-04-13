@@ -148,7 +148,26 @@ def flash_fwd_kernel(
     o_i /= l_i[:, None]  # Store the output and the normalizer
 
     tl.store(O_block_ptr, o_i, boundary_check=(0, 1))
-    tl.store(L_block_ptr, l_i, boundary_check=(0,))
+    tl.store(L_block_ptr, m_i + tl.log(l_i), boundary_check=(0,))
+
+
+def _rowsum(x, y):
+    return torch.diag_embed(torch.sum(x * y, dim=-1))
+
+def _flash_bwd_kernel_torch(q, k, v, o, do, l):
+    # q, k, v, o, do: [B, L, D]
+    # l: [B, L]
+    d = q.shape[-1]
+    scale = d ** -0.5
+    D = _rowsum(o, do)  # [B, L, L]
+    s = q @ k.mT * scale # [B, L, L]
+    p = torch.exp(s - l.unsqueeze(-1)) # [B, L, L]
+    dv = p.mT @ do
+    dp = do @ v.mT
+    ds = _rowsum(p, dp - D) # [B, L, L]
+    dq = ds @ k * scale
+    dk = ds @ q * scale
+    return dq, dk, dv
 
 
 class TritonFlashAttnFunc(torch.autograd.Function):
