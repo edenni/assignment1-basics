@@ -29,10 +29,19 @@ class FlashAttentionFunc(torch.autograd.Function):
                     o_i = torch.zeros_like(q_tile)
 
                     for j in range(0, N, B_kv):
+                        if is_causal and j >= i + B_q:
+                            break
+
                         k_tile = k[j : j + B_kv]  # T * D
                         v_tile = v[j : j + B_kv]  # T * D
 
                         scores = torch.matmul(q_tile, k_tile.T) * scale  # T * T
+
+                        if is_causal:
+                            row_idx = torch.arange(i, i + q_tile.shape[0], device=q.device)[:, None]
+                            col_idx = torch.arange(j, j + k_tile.shape[0], device=q.device)[None, :]
+                            scores = scores.masked_fill(row_idx < col_idx, float("-inf"))
+
                         m_ij = scores.max(dim=-1).values  # T
                         m_new = torch.maximum(m_i, m_ij)
 
@@ -44,6 +53,7 @@ class FlashAttentionFunc(torch.autograd.Function):
                     O[b, h, i : i + B_q] = o_i
                     L[b, h, i : i + B_q] = l_i
         ctx.save_for_backward(Q, K, V, O, L)
+        ctx.is_causal = is_causal
         return O
 
     @staticmethod
@@ -84,6 +94,7 @@ def flash_fwd_kernel(
     Q_TILE_SIZE: tl.constexpr,
     K_TILE_SIZE: tl.constexpr,
     NH: tl.constexpr,
+    IS_CAUSAL: tl.constexpr = False,
 ):
     # Program indices
     query_tile_index = tl.program_id(0)
@@ -139,11 +150,23 @@ def flash_fwd_kernel(
     l_i = tl.zeros((q_tile.shape[0],), dtype=tl.float32)  # [Q_TILE_SIZE]
     m_i = tl.full((q_tile.shape[0],), float("-inf"), dtype=tl.float32)  # [Q_TILE_SIZE]
 
-    for _ in range(0, N_KEYS, K_TILE_SIZE):
+    if IS_CAUSAL:
+        kv_end = tl.minimum(N_KEYS, (query_tile_index + 1) * Q_TILE_SIZE)
+    else:
+        kv_end = N_KEYS
+
+    
+    for j in range(0, kv_end, K_TILE_SIZE):
         k_tile = tl.load(K_block_ptr, boundary_check=(0, 1)).to(tl.float32)  # [K_TILE_SIZE, D]
         v_tile = tl.load(V_block_ptr, boundary_check=(0, 1)).to(tl.float32)  # [K_TILE_SIZE, D]
 
         scores = tl.dot(q_tile, tl.trans(k_tile)) * scale  # [Q_TILE_SIZE, K_TILE_SIZE]
+
+        if IS_CAUSAL:
+            row_idx = query_tile_index * Q_TILE_SIZE + tl.arange(0, Q_TILE_SIZE)
+            col_idx = j + tl.arange(0, K_TILE_SIZE)
+            scores = tl.where(row_idx[:, None] >= col_idx[None, :], scores, float("-inf"))
+
         m_ij = tl.maximum(m_i, scores.max(axis=1))  # [Q_TILE_SIZE]
 
         exp_scores = tl.exp(scores - m_ij[:, None])  # [Q_TILE_SIZE, K_TILE_SIZE]
@@ -164,13 +187,19 @@ def _rowsum(x, y):
     return torch.sum(x * y, dim=-1)
 
 
-def _flash_bwd_kernel_torch(q, k, v, o, do, l):
+def _flash_bwd_kernel_torch(q, k, v, o, do, l, is_causal=False):
     # q, k, v, o, do: [B, H, L, D]
     # l: [B, H, L]
     d = q.shape[-1]
+    L = q.shape[-2]
     scale = d ** -0.5
     D = _rowsum(o, do)  # [B, H, L]
     s = q @ k.mT * scale # [B, H, L, L]
+    if is_causal:
+        row_idx = torch.arange(L, device=q.device)[:, None]
+        col_idx = torch.arange(L, device=q.device)[None, :]
+        causal_mask = row_idx < col_idx
+        s = s.masked_fill(causal_mask, float("-inf"))
     p = torch.exp(s - l.unsqueeze(-1)) # [B, H, L, L]
     dv = p.mT @ do
     dp = do @ v.mT
@@ -236,6 +265,7 @@ def flash_bwd_kernel(
     BLOCK_M: tl.constexpr,
     BLOCK_N: tl.constexpr,
     NH: tl.constexpr,
+    IS_CAUSAL: tl.constexpr = False,
 ):
     pid_n = tl.program_id(0)
     bh = tl.program_id(1)
@@ -299,7 +329,16 @@ def flash_bwd_kernel(
         order=(0,),
     )
 
-    for i in range(0, N, BLOCK_M):
+    if IS_CAUSAL:
+        loop_start = pid_n * BLOCK_N
+        q_block_ptr = q_block_ptr.advance((loop_start, 0))
+        do_block_ptr = do_block_ptr.advance((loop_start, 0))
+        l_block_ptr = l_block_ptr.advance((loop_start,))
+        D_block_ptr = D_block_ptr.advance((loop_start,))
+    else:
+        loop_start = 0
+
+    for i in range(loop_start, N, BLOCK_M):
         q = tl.load(q_block_ptr, boundary_check=(0, 1))
         do = tl.load(do_block_ptr, boundary_check=(0, 1))
         l_tile = tl.load(l_block_ptr, boundary_check=(0,))
@@ -307,6 +346,12 @@ def flash_bwd_kernel(
 
         # S_i^(j) and P_i^(j)
         qk = tl.dot(q, tl.trans(k)) * scale
+
+        if IS_CAUSAL:
+            row_idx = i + tl.arange(0, BLOCK_M)
+            col_idx = pid_n * BLOCK_N + tl.arange(0, BLOCK_N)
+            qk = tl.where(row_idx[:, None] >= col_idx[None, :], qk, float("-inf"))
+
         p = tl.exp(qk - l_tile[:, None])
 
         # dV(j) += P^T @ dO
@@ -399,14 +444,16 @@ class TritonFlashAttnFunc(torch.autograd.Function):
             Q_TILE_SIZE=ctx.Q_TILE_SIZE,
             K_TILE_SIZE=ctx.K_TILE_SIZE,
             NH=H,
+            IS_CAUSAL=is_causal,
         )
-        # ctx.is_causal = is_causal
+        ctx.is_causal = is_causal
         ctx.save_for_backward(Q, K, V, out_final, l_final)
         return out_final.to(Q.dtype)
 
     @staticmethod
     def backward(ctx, do):
         Q, K, V, O, L = ctx.saved_tensors
+        is_causal = ctx.is_causal
         bs, H, N, d = Q.shape
         scale = 1 / (d**0.5)
 
@@ -433,14 +480,15 @@ class TritonFlashAttnFunc(torch.autograd.Function):
             dV.stride(0), dV.stride(1), dV.stride(2), dV.stride(3),
             N=N, scale=scale,
             D=d, BLOCK_M=BLOCK_M, BLOCK_N=BLOCK_N, NH=H,
+            IS_CAUSAL=is_causal,
         )
 
         return dQ.to(Q.dtype), dK.to(K.dtype), dV.to(V.dtype), None
 
 def test_consistency():
     x = torch.randn(4, 8, 32, 128, device="cuda", dtype=torch.bfloat16, requires_grad=True)
-    output = TritonFlashAttnFunc.apply(x, x, x)
-    actual = torch.nn.functional.scaled_dot_product_attention(x, x, x)
+    output = TritonFlashAttnFunc.apply(x, x, x, True)
+    actual = torch.nn.functional.scaled_dot_product_attention(x, x, x, is_causal=True)
     atol = 5e-2 if x.dtype == torch.bfloat16 else 1e-5
     rtol = 5e-2 if x.dtype == torch.bfloat16 else 1e-5
     torch.testing.assert_close(output, actual, atol=atol, rtol=rtol)
