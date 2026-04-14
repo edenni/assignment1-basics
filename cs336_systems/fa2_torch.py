@@ -158,7 +158,12 @@ def flash_fwd_kernel(
         order=(0,),
     )
 
+    # Pre-scale Q by log2(e) * scale so we work in log2 space
+    # This lets us use exp2 instead of exp — native GPU instruction, better CSE/LICM
+    qk_scale: tl.constexpr = 1.44269504  # log2(e)
     q_tile = tl.load(Q_block_ptr, boundary_check=(0, 1))  # [Q_TILE_SIZE, D] bf16
+    q_tile = (q_tile * (scale * qk_scale)).to(tl.bfloat16)
+
     o_i = tl.zeros((Q_TILE_SIZE, D), dtype=tl.float32)
     l_i = tl.zeros((Q_TILE_SIZE,), dtype=tl.float32)
     m_i = tl.full((Q_TILE_SIZE,), float("-inf"), dtype=tl.float32)
@@ -173,19 +178,21 @@ def flash_fwd_kernel(
         v_tile = tl.load(V_block_ptr, boundary_check=(0, 1))  # [K_TILE_SIZE, D] bf16
 
         # bf16 x bf16 dot -> fp32 accumulation (tensor cores)
-        scores = tl.dot(q_tile, tl.trans(k_tile)) * scale
+        # scale is already baked into q_tile, so scores are in log2 space
+        scores = tl.dot(q_tile, tl.trans(k_tile))
 
         if IS_CAUSAL:
             row_idx = query_tile_index * Q_TILE_SIZE + tl.arange(0, Q_TILE_SIZE)
             col_idx = j + tl.arange(0, K_TILE_SIZE)
             scores = tl.where(row_idx[:, None] >= col_idx[None, :], scores, float("-inf"))
 
-        m_ij = tl.maximum(m_i, scores.max(axis=1))
+        m_ij = tl.maximum(m_i, tl.max(scores, axis=1))
 
-        exp_scores = tl.exp(scores - m_ij[:, None])
-        l_i = tl.exp(m_i - m_ij) * l_i + tl.sum(exp_scores, axis=1)
+        exp_scores = tl.math.exp2(scores - m_ij[:, None])
+        alpha = tl.math.exp2(m_i - m_ij)
+        l_i = alpha * l_i + tl.sum(exp_scores, axis=1)
         # Cast exp_scores to bf16 for tensor core dot with v_tile
-        o_i = tl.exp(m_i - m_ij)[:, None] * o_i + tl.dot(exp_scores.to(tl.bfloat16), v_tile)
+        o_i = alpha[:, None] * o_i + tl.dot(exp_scores.to(tl.bfloat16), v_tile)
         m_i = m_ij
 
         K_block_ptr = K_block_ptr.advance((K_TILE_SIZE, 0))
@@ -194,7 +201,8 @@ def flash_fwd_kernel(
     o_i /= l_i[:, None]  # Store the output and the normalizer
 
     tl.store(O_block_ptr, o_i.to(tl.bfloat16), boundary_check=(0, 1))
-    tl.store(L_block_ptr, m_i + tl.math.log(l_i), boundary_check=(0,))
+    # Store L in log2 space (m + log2(l)) — backward kernels will use exp2 accordingly
+    tl.store(L_block_ptr, m_i + tl.math.log2(l_i), boundary_check=(0,))
 
 
 def _rowsum(x, y):
@@ -305,6 +313,10 @@ def flash_bwd_dq_kernel(
 
     dq = tl.zeros((BLOCK_M, D), dtype=tl.float32)
 
+    # Pre-scale Q for log2-space dot products (matching forward kernel)
+    qk_scale: tl.constexpr = 1.44269504  # log2(e)
+    q = (q * (scale * qk_scale)).to(tl.bfloat16)
+
     # Pointers for K, V tiles (will be advanced in loop)
     k_block_ptr = tl.make_block_ptr(
         K_ptr + b * stride_kb + h * stride_kh,
@@ -326,14 +338,16 @@ def flash_bwd_dq_kernel(
         k = tl.load(k_block_ptr, boundary_check=(0, 1))
         v = tl.load(v_block_ptr, boundary_check=(0, 1))
 
-        qk = tl.dot(q, tl.trans(k)) * scale
+        # scores in log2 space (scale baked into q)
+        qk = tl.dot(q, tl.trans(k))
 
         if IS_CAUSAL:
             row_idx = pid_m * BLOCK_M + tl.arange(0, BLOCK_M)
             col_idx = j + tl.arange(0, BLOCK_N)
             qk = tl.where(row_idx[:, None] >= col_idx[None, :], qk, float("-inf"))
 
-        p = tl.exp(qk - l_tile[:, None])
+        # L is in log2 space, so use exp2
+        p = tl.math.exp2(qk - l_tile[:, None])
 
         dp = tl.dot(do, tl.trans(v))
         ds = p * (dp - D_tile[:, None]) * scale
@@ -442,20 +456,25 @@ def flash_bwd_dkdv_kernel(
     else:
         loop_start = 0
 
+    # Pre-scale for log2-space dot products
+    qk_scale: tl.constexpr = 1.44269504  # log2(e)
+
     for i in range(loop_start, N, BLOCK_M):
         q = tl.load(q_block_ptr, boundary_check=(0, 1))
         do = tl.load(do_block_ptr, boundary_check=(0, 1))
         l_tile = tl.load(l_block_ptr, boundary_check=(0,))
         D_tile = tl.load(D_block_ptr, boundary_check=(0,))
 
-        qk = tl.dot(q, tl.trans(k)) * scale
+        # scores in log2 space
+        qk = tl.dot(q, tl.trans(k)) * (scale * qk_scale)
 
         if IS_CAUSAL:
             row_idx = i + tl.arange(0, BLOCK_M)
             col_idx = pid_n * BLOCK_N + tl.arange(0, BLOCK_N)
             qk = tl.where(row_idx[:, None] >= col_idx[None, :], qk, float("-inf"))
 
-        p = tl.exp(qk - l_tile[:, None])
+        # L is in log2 space, so use exp2
+        p = tl.math.exp2(qk - l_tile[:, None])
 
         dv += tl.dot(tl.trans(p.to(tl.bfloat16)), do)
 
