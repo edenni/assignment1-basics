@@ -162,6 +162,7 @@ def flash_fwd_kernel(
 def _rowsum(x, y):
     return torch.sum(x * y, dim=-1)
 
+
 def _flash_bwd_kernel_torch(q, k, v, o, do, l):
     # q, k, v, o, do: [B, H, L, D]
     # l: [B, H, L]
@@ -176,6 +177,179 @@ def _flash_bwd_kernel_torch(q, k, v, o, do, l):
     dq = ds @ k * scale
     dk = ds.mT @ q * scale
     return dq, dk, dv
+
+
+@triton.jit
+def flash_bwd_kernel(
+    Q_ptr,
+    K_ptr,
+    V_ptr,
+    O_ptr,
+    dO_ptr,
+    L_ptr,
+    D_ptr,
+    dQ_ptr,
+    dK_ptr,
+    dV_ptr,
+    stride_qb,
+    stride_qh,
+    stride_qn,
+    stride_qd,
+    stride_kb,
+    stride_kh,
+    stride_kn,
+    stride_kd,
+    stride_vb,
+    stride_vh,
+    stride_vn,
+    stride_vd,
+    stride_ob,
+    stride_oh,
+    stride_on,
+    stride_od,
+    stride_dob,
+    stride_doh,
+    stride_don,
+    stride_dod,
+    stride_lb,
+    stride_lh,
+    stride_ln,
+    stride_db,
+    stride_dh,
+    stride_dn,
+    stride_dqb,
+    stride_dqh,
+    stride_dqn,
+    stride_dqd,
+    stride_dkb,
+    stride_dkh,
+    stride_dkn,
+    stride_dkd,
+    stride_dvb,
+    stride_dvh,
+    stride_dvn,
+    stride_dvd,
+    N,
+    scale,
+    D: tl.constexpr,
+    BLOCK_M: tl.constexpr,
+    BLOCK_N: tl.constexpr,
+    NH: tl.constexpr,
+):
+    pid_n = tl.program_id(0)
+    bh = tl.program_id(1)
+    b = bh // NH
+    h = bh % NH
+
+    # Load K(j), V(j)
+    k_block_ptr = tl.make_block_ptr(
+        K_ptr + b * stride_kb + h * stride_kh,
+        shape=(N, D),
+        strides=(stride_kn, stride_kd),
+        offsets=(pid_n * BLOCK_N, 0),
+        block_shape=(BLOCK_N, D),
+        order=(1, 0),
+    )
+    v_block_ptr = tl.make_block_ptr(
+        V_ptr + b * stride_vb + h * stride_vh,
+        shape=(N, D),
+        strides=(stride_vn, stride_vd),
+        offsets=(pid_n * BLOCK_N, 0),
+        block_shape=(BLOCK_N, D),
+        order=(1, 0),
+    )
+    k = tl.load(k_block_ptr, boundary_check=(0, 1))
+    v = tl.load(v_block_ptr, boundary_check=(0, 1))
+
+    dk = tl.zeros((BLOCK_N, D), dtype=tl.float32)
+    dv = tl.zeros((BLOCK_N, D), dtype=tl.float32)
+
+    # Pointers for Q, dO, L, D tiles (will be advanced in loop)
+    q_block_ptr = tl.make_block_ptr(
+        Q_ptr + b * stride_qb + h * stride_qh,
+        shape=(N, D),
+        strides=(stride_qn, stride_qd),
+        offsets=(0, 0),
+        block_shape=(BLOCK_M, D),
+        order=(1, 0),
+    )
+    do_block_ptr = tl.make_block_ptr(
+        dO_ptr + b * stride_dob + h * stride_doh,
+        shape=(N, D),
+        strides=(stride_don, stride_dod),
+        offsets=(0, 0),
+        block_shape=(BLOCK_M, D),
+        order=(1, 0),
+    )
+    l_block_ptr = tl.make_block_ptr(
+        L_ptr + b * stride_lb + h * stride_lh,
+        shape=(N,),
+        strides=(stride_ln,),
+        offsets=(0,),
+        block_shape=(BLOCK_M,),
+        order=(0,),
+    )
+    D_block_ptr = tl.make_block_ptr(
+        D_ptr + b * stride_db + h * stride_dh,
+        shape=(N,),
+        strides=(stride_dn,),
+        offsets=(0,),
+        block_shape=(BLOCK_M,),
+        order=(0,),
+    )
+
+    for i in range(0, N, BLOCK_M):
+        q = tl.load(q_block_ptr, boundary_check=(0, 1))
+        do = tl.load(do_block_ptr, boundary_check=(0, 1))
+        l_tile = tl.load(l_block_ptr, boundary_check=(0,))
+        D_tile = tl.load(D_block_ptr, boundary_check=(0,))
+
+        # S_i^(j) and P_i^(j)
+        qk = tl.dot(q, tl.trans(k), allow_tf32=False) * scale
+        p = tl.exp(qk - l_tile[:, None])
+
+        # dV(j) += P^T @ dO
+        dv += tl.dot(tl.trans(p), do, allow_tf32=False)
+
+        # dP and dS
+        dp = tl.dot(do, tl.trans(v), allow_tf32=False)
+        ds = p * (dp - D_tile[:, None]) * scale
+
+        # Atomic add dQ(i)
+        offs_m = i + tl.arange(0, BLOCK_M)
+        offs_d = tl.arange(0, D)
+        dQ_ptrs = dQ_ptr + b * stride_dqb + h * stride_dqh + offs_m[:, None] * stride_dqn + offs_d[None, :] * stride_dqd
+        dq = tl.dot(ds, k, allow_tf32=False)
+        mask = (offs_m[:, None] < N) & (offs_d[None, :] < D)
+        tl.atomic_add(dQ_ptrs, dq, mask=mask)
+
+        # dK(j) += dS^T @ Q
+        dk += tl.dot(tl.trans(ds), q, allow_tf32=False)
+
+        q_block_ptr = q_block_ptr.advance((BLOCK_M, 0))
+        do_block_ptr = do_block_ptr.advance((BLOCK_M, 0))
+        l_block_ptr = l_block_ptr.advance((BLOCK_M,))
+        D_block_ptr = D_block_ptr.advance((BLOCK_M,))
+
+    # Store dK(j), dV(j)
+    dk_block_ptr = tl.make_block_ptr(
+        dK_ptr + b * stride_dkb + h * stride_dkh,
+        shape=(N, D),
+        strides=(stride_dkn, stride_dkd),
+        offsets=(pid_n * BLOCK_N, 0),
+        block_shape=(BLOCK_N, D),
+        order=(1, 0),
+    )
+    dv_block_ptr = tl.make_block_ptr(
+        dV_ptr + b * stride_dvb + h * stride_dvh,
+        shape=(N, D),
+        strides=(stride_dvn, stride_dvd),
+        offsets=(pid_n * BLOCK_N, 0),
+        block_shape=(BLOCK_N, D),
+        order=(1, 0),
+    )
+    tl.store(dk_block_ptr, dk, boundary_check=(0, 1))
+    tl.store(dv_block_ptr, dv, boundary_check=(0, 1))
 
 
 class TritonFlashAttnFunc(torch.autograd.Function):
@@ -232,11 +406,58 @@ class TritonFlashAttnFunc(torch.autograd.Function):
     @staticmethod
     def backward(ctx, do):
         Q, K, V, O, L = ctx.saved_tensors
-        dq, dk, dv = _flash_bwd_kernel_torch(Q, K, V, O, do, L)
-        return dq, dk, dv, None
+        bs, H, N, d = Q.shape
+        scale = 1 / (d**0.5)
+
+        BLOCK_M = 16
+        BLOCK_N = 16
+
+        D = _rowsum(O, do)
+
+        dQ = torch.zeros_like(Q)
+        dK = torch.empty_like(K)
+        dV = torch.empty_like(V)
+
+        flash_bwd_kernel[(triton.cdiv(N, BLOCK_N), bs * H)](
+            Q, K, V, O, do, L, D, dQ, dK, dV,
+            Q.stride(0), Q.stride(1), Q.stride(2), Q.stride(3),
+            K.stride(0), K.stride(1), K.stride(2), K.stride(3),
+            V.stride(0), V.stride(1), V.stride(2), V.stride(3),
+            O.stride(0), O.stride(1), O.stride(2), O.stride(3),
+            do.stride(0), do.stride(1), do.stride(2), do.stride(3),
+            L.stride(0), L.stride(1), L.stride(2),
+            D.stride(0), D.stride(1), D.stride(2),
+            dQ.stride(0), dQ.stride(1), dQ.stride(2), dQ.stride(3),
+            dK.stride(0), dK.stride(1), dK.stride(2), dK.stride(3),
+            dV.stride(0), dV.stride(1), dV.stride(2), dV.stride(3),
+            N=N, scale=scale,
+            D=d, BLOCK_M=BLOCK_M, BLOCK_N=BLOCK_N, NH=H,
+        )
+
+        return dQ, dK, dV, None
+
+def test_timing_flash_forward_backward():
+    bs = 4
+    n_heads = 16
+    d_head = 64
+    sequence_length = 8192
+    q, k, v = torch.randn(
+        3, bs, n_heads, sequence_length, d_head, device='cuda', dtype=torch.bfloat16, requires_grad=True
+    )
+    flash = torch.compile(TritonFlashAttnFunc.apply)
+
+
+    def flash_forward_backward():
+        o = flash(q, k, v, True)
+        loss = o.sum()
+        loss.backward()
+
+    results = triton.testing.do_bench(flash_forward_backward, rep=100, warmup=100)
+    print(results)
+
 
 if __name__ == "__main__":
-    x = torch.randn(4, 8, 32, 128, device="cuda", dtype=torch.float32, requires_grad=True)
+    x = torch.randn(4, 8, 32, 128, device="cuda", dtype=torch.bfloat16, requires_grad=True)
     output = TritonFlashAttnFunc.apply(x, x, x)
     actual = torch.nn.functional.scaled_dot_product_attention(x, x, x)
     torch.testing.assert_close(output, actual, atol=1e-5, rtol=1e-5)
@@ -248,6 +469,7 @@ if __name__ == "__main__":
     loss = actual.sum()
     loss.backward()
     torch.testing.assert_close(x.grad, x_grad, atol=1e-5, rtol=1e-5)
+    # test_timing_flash_forward_backward()
 
     # output = FlashAttentionFunc.apply(x, x, x)
     # actual = torch.nn.functional.scaled_dot_product_attention(x, x, x)
