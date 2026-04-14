@@ -148,25 +148,25 @@ def flash_fwd_kernel(
     o_i /= l_i[:, None]  # Store the output and the normalizer
 
     tl.store(O_block_ptr, o_i, boundary_check=(0, 1))
-    tl.store(L_block_ptr, m_i + tl.log(l_i), boundary_check=(0,))
+    tl.store(L_block_ptr, m_i + tl.math.log(l_i), boundary_check=(0,))
 
 
 def _rowsum(x, y):
-    return torch.diag_embed(torch.sum(x * y, dim=-1))
+    return torch.sum(x * y, dim=-1)
 
 def _flash_bwd_kernel_torch(q, k, v, o, do, l):
     # q, k, v, o, do: [B, L, D]
     # l: [B, L]
     d = q.shape[-1]
     scale = d ** -0.5
-    D = _rowsum(o, do)  # [B, L, L]
+    D = _rowsum(o, do)  # [B, L]
     s = q @ k.mT * scale # [B, L, L]
     p = torch.exp(s - l.unsqueeze(-1)) # [B, L, L]
     dv = p.mT @ do
     dp = do @ v.mT
-    ds = _rowsum(p, dp - D) # [B, L, L]
+    ds = p * (dp - D.unsqueeze(-1))  # [B, L, L]
     dq = ds @ k * scale
-    dk = ds @ q * scale
+    dk = ds.mT @ q * scale
     return dq, dk, dv
 
 
@@ -212,15 +212,28 @@ class TritonFlashAttnFunc(torch.autograd.Function):
             K_TILE_SIZE=ctx.K_TILE_SIZE,
         )
         # ctx.is_causal = is_causal
-        # ctx.save_for_backward(l_final, Q, K, V, out_final)
+        ctx.save_for_backward(Q, K, V, out_final, l_final)
         return out_final
 
+    @staticmethod
+    def backward(ctx, do):
+        Q, K, V, O, L = ctx.saved_tensors
+        dq, dk, dv = _flash_bwd_kernel_torch(Q, K, V, O, do, L)
+        return dq, dk, dv, None
 
 if __name__ == "__main__":
-    x = torch.randn(4, 32, 128, device="cuda", dtype=torch.float32)
+    x = torch.randn(4, 32, 128, device="cuda", dtype=torch.float32, requires_grad=True)
     output = TritonFlashAttnFunc.apply(x, x, x)
     actual = torch.nn.functional.scaled_dot_product_attention(x, x, x)
     torch.testing.assert_close(output, actual, atol=1e-5, rtol=1e-5)
+
+    loss = output.sum()
+    loss.backward()
+    x_grad = x.grad.clone()
+    x.grad.zero_()
+    loss = actual.sum()
+    loss.backward()
+    torch.testing.assert_close(x.grad, x_grad, atol=1e-5, rtol=1e-5)
 
     # output = FlashAttentionFunc.apply(x, x, x)
     # actual = torch.nn.functional.scaled_dot_product_attention(x, x, x)
