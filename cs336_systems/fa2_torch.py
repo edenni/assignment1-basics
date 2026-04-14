@@ -61,6 +61,19 @@ class FlashAttentionFunc(torch.autograd.Function):
         raise NotImplementedError("Backward pass for FlashAttention is not implemented yet.")
 
 
+@triton.autotune(
+    configs=[
+        triton.Config({"Q_TILE_SIZE": 16, "K_TILE_SIZE": 16}, num_warps=2, num_stages=1),
+        triton.Config({"Q_TILE_SIZE": 32, "K_TILE_SIZE": 32}, num_warps=4, num_stages=1),
+        triton.Config({"Q_TILE_SIZE": 64, "K_TILE_SIZE": 64}, num_warps=4, num_stages=1),
+        triton.Config({"Q_TILE_SIZE": 128, "K_TILE_SIZE": 64}, num_warps=4, num_stages=1),
+        triton.Config({"Q_TILE_SIZE": 64, "K_TILE_SIZE": 128}, num_warps=4, num_stages=1),
+        triton.Config({"Q_TILE_SIZE": 128, "K_TILE_SIZE": 128}, num_warps=8, num_stages=1),
+        triton.Config({"Q_TILE_SIZE": 32, "K_TILE_SIZE": 64}, num_warps=4, num_stages=1),
+        triton.Config({"Q_TILE_SIZE": 64, "K_TILE_SIZE": 32}, num_warps=4, num_stages=1),
+    ],
+    key=["N_QUERIES", "N_KEYS", "D"],
+)
 @triton.jit
 def flash_fwd_kernel(
     Q_ptr,
@@ -209,58 +222,142 @@ def _flash_bwd_kernel_torch(q, k, v, o, do, l, is_causal=False):
     return dq, dk, dv
 
 
+############################
+# Pass 1: dQ kernel (row-major)
+# Each program owns a Q-tile (row i), loops over K-tiles (columns j)
+############################
+@triton.autotune(
+    configs=[
+        triton.Config({"BLOCK_M": 16, "BLOCK_N": 16}, num_warps=2, num_stages=1),
+        triton.Config({"BLOCK_M": 32, "BLOCK_N": 32}, num_warps=4, num_stages=1),
+        triton.Config({"BLOCK_M": 64, "BLOCK_N": 64}, num_warps=4, num_stages=1),
+        triton.Config({"BLOCK_M": 128, "BLOCK_N": 128}, num_warps=8, num_stages=1),
+    ],
+    key=["N", "D"],
+)
 @triton.jit
-def flash_bwd_kernel(
-    Q_ptr,
-    K_ptr,
-    V_ptr,
-    O_ptr,
-    dO_ptr,
-    L_ptr,
-    D_ptr,
-    dQ_ptr,
-    dK_ptr,
-    dV_ptr,
-    stride_qb,
-    stride_qh,
-    stride_qn,
-    stride_qd,
-    stride_kb,
-    stride_kh,
-    stride_kn,
-    stride_kd,
-    stride_vb,
-    stride_vh,
-    stride_vn,
-    stride_vd,
-    stride_ob,
-    stride_oh,
-    stride_on,
-    stride_od,
-    stride_dob,
-    stride_doh,
-    stride_don,
-    stride_dod,
-    stride_lb,
-    stride_lh,
-    stride_ln,
-    stride_db,
-    stride_dh,
-    stride_dn,
-    stride_dqb,
-    stride_dqh,
-    stride_dqn,
-    stride_dqd,
-    stride_dkb,
-    stride_dkh,
-    stride_dkn,
-    stride_dkd,
-    stride_dvb,
-    stride_dvh,
-    stride_dvn,
-    stride_dvd,
-    N,
-    scale,
+def flash_bwd_dq_kernel(
+    Q_ptr, K_ptr, V_ptr, dO_ptr, L_ptr, D_ptr, dQ_ptr,
+    stride_qb, stride_qh, stride_qn, stride_qd,
+    stride_kb, stride_kh, stride_kn, stride_kd,
+    stride_vb, stride_vh, stride_vn, stride_vd,
+    stride_dob, stride_doh, stride_don, stride_dod,
+    stride_lb, stride_lh, stride_ln,
+    stride_db, stride_dh, stride_dn,
+    stride_dqb, stride_dqh, stride_dqn, stride_dqd,
+    N, scale,
+    D: tl.constexpr,
+    BLOCK_M: tl.constexpr,
+    BLOCK_N: tl.constexpr,
+    NH: tl.constexpr,
+    IS_CAUSAL: tl.constexpr = False,
+):
+    pid_m = tl.program_id(0)
+    bh = tl.program_id(1)
+    b = bh // NH
+    h = bh % NH
+
+    # Load Q(i), dO(i), L(i), D(i) — owned by this program
+    q_block_ptr = tl.make_block_ptr(
+        Q_ptr + b * stride_qb + h * stride_qh,
+        shape=(N, D), strides=(stride_qn, stride_qd),
+        offsets=(pid_m * BLOCK_M, 0), block_shape=(BLOCK_M, D), order=(1, 0),
+    )
+    do_block_ptr = tl.make_block_ptr(
+        dO_ptr + b * stride_dob + h * stride_doh,
+        shape=(N, D), strides=(stride_don, stride_dod),
+        offsets=(pid_m * BLOCK_M, 0), block_shape=(BLOCK_M, D), order=(1, 0),
+    )
+    l_block_ptr = tl.make_block_ptr(
+        L_ptr + b * stride_lb + h * stride_lh,
+        shape=(N,), strides=(stride_ln,),
+        offsets=(pid_m * BLOCK_M,), block_shape=(BLOCK_M,), order=(0,),
+    )
+    D_block_ptr = tl.make_block_ptr(
+        D_ptr + b * stride_db + h * stride_dh,
+        shape=(N,), strides=(stride_dn,),
+        offsets=(pid_m * BLOCK_M,), block_shape=(BLOCK_M,), order=(0,),
+    )
+
+    q = tl.load(q_block_ptr, boundary_check=(0, 1))
+    do = tl.load(do_block_ptr, boundary_check=(0, 1))
+    l_tile = tl.load(l_block_ptr, boundary_check=(0,))
+    D_tile = tl.load(D_block_ptr, boundary_check=(0,))
+
+    dq = tl.zeros((BLOCK_M, D), dtype=tl.float32)
+
+    # Pointers for K, V tiles (will be advanced in loop)
+    k_block_ptr = tl.make_block_ptr(
+        K_ptr + b * stride_kb + h * stride_kh,
+        shape=(N, D), strides=(stride_kn, stride_kd),
+        offsets=(0, 0), block_shape=(BLOCK_N, D), order=(1, 0),
+    )
+    v_block_ptr = tl.make_block_ptr(
+        V_ptr + b * stride_vb + h * stride_vh,
+        shape=(N, D), strides=(stride_vn, stride_vd),
+        offsets=(0, 0), block_shape=(BLOCK_N, D), order=(1, 0),
+    )
+
+    if IS_CAUSAL:
+        kv_end = tl.minimum(N, (pid_m + 1) * BLOCK_M)
+    else:
+        kv_end = N
+
+    for j in range(0, kv_end, BLOCK_N):
+        k = tl.load(k_block_ptr, boundary_check=(0, 1))
+        v = tl.load(v_block_ptr, boundary_check=(0, 1))
+
+        qk = tl.dot(q, tl.trans(k)) * scale
+
+        if IS_CAUSAL:
+            row_idx = pid_m * BLOCK_M + tl.arange(0, BLOCK_M)
+            col_idx = j + tl.arange(0, BLOCK_N)
+            qk = tl.where(row_idx[:, None] >= col_idx[None, :], qk, float("-inf"))
+
+        p = tl.exp(qk - l_tile[:, None])
+
+        dp = tl.dot(do, tl.trans(v))
+        ds = p * (dp - D_tile[:, None]) * scale
+
+        dq += tl.dot(ds.to(q.dtype), k)
+
+        k_block_ptr = k_block_ptr.advance((BLOCK_N, 0))
+        v_block_ptr = v_block_ptr.advance((BLOCK_N, 0))
+
+    # Store dQ(i) — no atomics needed
+    dq_block_ptr = tl.make_block_ptr(
+        dQ_ptr + b * stride_dqb + h * stride_dqh,
+        shape=(N, D), strides=(stride_dqn, stride_dqd),
+        offsets=(pid_m * BLOCK_M, 0), block_shape=(BLOCK_M, D), order=(1, 0),
+    )
+    tl.store(dq_block_ptr, dq.to(q.dtype), boundary_check=(0, 1))
+
+
+############################
+# Pass 2: dK/dV kernel (column-major)
+# Each program owns a K-tile (column j), loops over Q-tiles (rows i)
+############################
+@triton.autotune(
+    configs=[
+        triton.Config({"BLOCK_M": 16, "BLOCK_N": 16}, num_warps=2, num_stages=1),
+        triton.Config({"BLOCK_M": 32, "BLOCK_N": 32}, num_warps=4, num_stages=1),
+        triton.Config({"BLOCK_M": 64, "BLOCK_N": 64}, num_warps=4, num_stages=1),
+        triton.Config({"BLOCK_M": 128, "BLOCK_N": 128}, num_warps=8, num_stages=1),
+    ],
+    key=["N", "D"],
+)
+@triton.jit
+def flash_bwd_dkdv_kernel(
+    Q_ptr, K_ptr, V_ptr, dO_ptr, L_ptr, D_ptr, dK_ptr, dV_ptr,
+    stride_qb, stride_qh, stride_qn, stride_qd,
+    stride_kb, stride_kh, stride_kn, stride_kd,
+    stride_vb, stride_vh, stride_vn, stride_vd,
+    stride_dob, stride_doh, stride_don, stride_dod,
+    stride_lb, stride_lh, stride_ln,
+    stride_db, stride_dh, stride_dn,
+    stride_dkb, stride_dkh, stride_dkn, stride_dkd,
+    stride_dvb, stride_dvh, stride_dvn, stride_dvd,
+    N, scale,
     D: tl.constexpr,
     BLOCK_M: tl.constexpr,
     BLOCK_N: tl.constexpr,
@@ -272,22 +369,16 @@ def flash_bwd_kernel(
     b = bh // NH
     h = bh % NH
 
-    # Load K(j), V(j)
+    # Load K(j), V(j) — owned by this program
     k_block_ptr = tl.make_block_ptr(
         K_ptr + b * stride_kb + h * stride_kh,
-        shape=(N, D),
-        strides=(stride_kn, stride_kd),
-        offsets=(pid_n * BLOCK_N, 0),
-        block_shape=(BLOCK_N, D),
-        order=(1, 0),
+        shape=(N, D), strides=(stride_kn, stride_kd),
+        offsets=(pid_n * BLOCK_N, 0), block_shape=(BLOCK_N, D), order=(1, 0),
     )
     v_block_ptr = tl.make_block_ptr(
         V_ptr + b * stride_vb + h * stride_vh,
-        shape=(N, D),
-        strides=(stride_vn, stride_vd),
-        offsets=(pid_n * BLOCK_N, 0),
-        block_shape=(BLOCK_N, D),
-        order=(1, 0),
+        shape=(N, D), strides=(stride_vn, stride_vd),
+        offsets=(pid_n * BLOCK_N, 0), block_shape=(BLOCK_N, D), order=(1, 0),
     )
     k = tl.load(k_block_ptr, boundary_check=(0, 1))
     v = tl.load(v_block_ptr, boundary_check=(0, 1))
@@ -298,35 +389,23 @@ def flash_bwd_kernel(
     # Pointers for Q, dO, L, D tiles (will be advanced in loop)
     q_block_ptr = tl.make_block_ptr(
         Q_ptr + b * stride_qb + h * stride_qh,
-        shape=(N, D),
-        strides=(stride_qn, stride_qd),
-        offsets=(0, 0),
-        block_shape=(BLOCK_M, D),
-        order=(1, 0),
+        shape=(N, D), strides=(stride_qn, stride_qd),
+        offsets=(0, 0), block_shape=(BLOCK_M, D), order=(1, 0),
     )
     do_block_ptr = tl.make_block_ptr(
         dO_ptr + b * stride_dob + h * stride_doh,
-        shape=(N, D),
-        strides=(stride_don, stride_dod),
-        offsets=(0, 0),
-        block_shape=(BLOCK_M, D),
-        order=(1, 0),
+        shape=(N, D), strides=(stride_don, stride_dod),
+        offsets=(0, 0), block_shape=(BLOCK_M, D), order=(1, 0),
     )
     l_block_ptr = tl.make_block_ptr(
         L_ptr + b * stride_lb + h * stride_lh,
-        shape=(N,),
-        strides=(stride_ln,),
-        offsets=(0,),
-        block_shape=(BLOCK_M,),
-        order=(0,),
+        shape=(N,), strides=(stride_ln,),
+        offsets=(0,), block_shape=(BLOCK_M,), order=(0,),
     )
     D_block_ptr = tl.make_block_ptr(
         D_ptr + b * stride_db + h * stride_dh,
-        shape=(N,),
-        strides=(stride_dn,),
-        offsets=(0,),
-        block_shape=(BLOCK_M,),
-        order=(0,),
+        shape=(N,), strides=(stride_dn,),
+        offsets=(0,), block_shape=(BLOCK_M,), order=(0,),
     )
 
     if IS_CAUSAL:
@@ -344,7 +423,6 @@ def flash_bwd_kernel(
         l_tile = tl.load(l_block_ptr, boundary_check=(0,))
         D_tile = tl.load(D_block_ptr, boundary_check=(0,))
 
-        # S_i^(j) and P_i^(j)
         qk = tl.dot(q, tl.trans(k)) * scale
 
         if IS_CAUSAL:
@@ -361,14 +439,6 @@ def flash_bwd_kernel(
         dp = tl.dot(do, tl.trans(v))
         ds = p * (dp - D_tile[:, None]) * scale
 
-        # Atomic add dQ(i)
-        offs_m = i + tl.arange(0, BLOCK_M)
-        offs_d = tl.arange(0, D)
-        dQ_ptrs = dQ_ptr + b * stride_dqb + h * stride_dqh + offs_m[:, None] * stride_dqn + offs_d[None, :] * stride_dqd
-        dq = tl.dot(ds.to(q.dtype), k)
-        mask = (offs_m[:, None] < N) & (offs_d[None, :] < D)
-        tl.atomic_add(dQ_ptrs, dq, mask=mask)
-
         # dK(j) += dS^T @ Q
         dk += tl.dot(tl.trans(ds.to(q.dtype)), q)
 
@@ -377,22 +447,16 @@ def flash_bwd_kernel(
         l_block_ptr = l_block_ptr.advance((BLOCK_M,))
         D_block_ptr = D_block_ptr.advance((BLOCK_M,))
 
-    # Store dK(j), dV(j)
+    # Store dK(j), dV(j) — no atomics needed
     dk_block_ptr = tl.make_block_ptr(
         dK_ptr + b * stride_dkb + h * stride_dkh,
-        shape=(N, D),
-        strides=(stride_dkn, stride_dkd),
-        offsets=(pid_n * BLOCK_N, 0),
-        block_shape=(BLOCK_N, D),
-        order=(1, 0),
+        shape=(N, D), strides=(stride_dkn, stride_dkd),
+        offsets=(pid_n * BLOCK_N, 0), block_shape=(BLOCK_N, D), order=(1, 0),
     )
     dv_block_ptr = tl.make_block_ptr(
         dV_ptr + b * stride_dvb + h * stride_dvh,
-        shape=(N, D),
-        strides=(stride_dvn, stride_dvd),
-        offsets=(pid_n * BLOCK_N, 0),
-        block_shape=(BLOCK_N, D),
-        order=(1, 0),
+        shape=(N, D), strides=(stride_dvn, stride_dvd),
+        offsets=(pid_n * BLOCK_N, 0), block_shape=(BLOCK_N, D), order=(1, 0),
     )
     tl.store(dk_block_ptr, dk.to(k.dtype), boundary_check=(0, 1))
     tl.store(dv_block_ptr, dv.to(v.dtype), boundary_check=(0, 1))
@@ -406,13 +470,13 @@ class TritonFlashAttnFunc(torch.autograd.Function):
         Nk = K.shape[2]
         scale = 1 / (d**0.5)
 
-        ctx.Q_TILE_SIZE = 16
-        ctx.K_TILE_SIZE = 16
-
         out_final = torch.empty_like(Q)
         l_final = torch.empty(bs, H, Nq, device=Q.device, dtype=torch.float32)
 
-        flash_fwd_kernel[(triton.cdiv(Nq, ctx.Q_TILE_SIZE), bs * H)](
+        def fwd_grid(meta):
+            return (triton.cdiv(Nq, meta["Q_TILE_SIZE"]), bs * H)
+
+        flash_fwd_kernel[fwd_grid](
             Q,
             K,
             V,
@@ -441,8 +505,6 @@ class TritonFlashAttnFunc(torch.autograd.Function):
             N_KEYS=Nk,
             scale=scale,
             D=d,
-            Q_TILE_SIZE=ctx.Q_TILE_SIZE,
-            K_TILE_SIZE=ctx.K_TILE_SIZE,
             NH=H,
             IS_CAUSAL=is_causal,
         )
@@ -457,33 +519,50 @@ class TritonFlashAttnFunc(torch.autograd.Function):
         bs, H, N, d = Q.shape
         scale = 1 / (d**0.5)
 
-        BLOCK_M = 16
-        BLOCK_N = 16
-
         D = _rowsum(O, do)
 
-        dQ = torch.zeros_like(Q, dtype=torch.float32)
+        dQ = torch.empty_like(Q)
         dK = torch.empty_like(K)
         dV = torch.empty_like(V)
 
-        flash_bwd_kernel[(triton.cdiv(N, BLOCK_N), bs * H)](
-            Q, K, V, O, do, L, D, dQ, dK, dV,
+        # Pass 1: dQ (row-major, each program owns a Q-tile)
+        def dq_grid(meta):
+            return (triton.cdiv(N, meta["BLOCK_M"]), bs * H)
+
+        flash_bwd_dq_kernel[dq_grid](
+            Q, K, V, do, L, D, dQ,
             Q.stride(0), Q.stride(1), Q.stride(2), Q.stride(3),
             K.stride(0), K.stride(1), K.stride(2), K.stride(3),
             V.stride(0), V.stride(1), V.stride(2), V.stride(3),
-            O.stride(0), O.stride(1), O.stride(2), O.stride(3),
             do.stride(0), do.stride(1), do.stride(2), do.stride(3),
             L.stride(0), L.stride(1), L.stride(2),
             D.stride(0), D.stride(1), D.stride(2),
             dQ.stride(0), dQ.stride(1), dQ.stride(2), dQ.stride(3),
-            dK.stride(0), dK.stride(1), dK.stride(2), dK.stride(3),
-            dV.stride(0), dV.stride(1), dV.stride(2), dV.stride(3),
             N=N, scale=scale,
-            D=d, BLOCK_M=BLOCK_M, BLOCK_N=BLOCK_N, NH=H,
+            D=d, NH=H,
             IS_CAUSAL=is_causal,
         )
 
-        return dQ.to(Q.dtype), dK.to(K.dtype), dV.to(V.dtype), None
+        # Pass 2: dK, dV (column-major, each program owns a K-tile)
+        def dkdv_grid(meta):
+            return (triton.cdiv(N, meta["BLOCK_N"]), bs * H)
+
+        flash_bwd_dkdv_kernel[dkdv_grid](
+            Q, K, V, do, L, D, dK, dV,
+            Q.stride(0), Q.stride(1), Q.stride(2), Q.stride(3),
+            K.stride(0), K.stride(1), K.stride(2), K.stride(3),
+            V.stride(0), V.stride(1), V.stride(2), V.stride(3),
+            do.stride(0), do.stride(1), do.stride(2), do.stride(3),
+            L.stride(0), L.stride(1), L.stride(2),
+            D.stride(0), D.stride(1), D.stride(2),
+            dK.stride(0), dK.stride(1), dK.stride(2), dK.stride(3),
+            dV.stride(0), dV.stride(1), dV.stride(2), dV.stride(3),
+            N=N, scale=scale,
+            D=d, NH=H,
+            IS_CAUSAL=is_causal,
+        )
+
+        return dQ, dK, dV, None
 
 def test_consistency():
     x = torch.randn(4, 8, 32, 128, device="cuda", dtype=torch.bfloat16, requires_grad=True)
