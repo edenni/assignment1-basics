@@ -1,6 +1,7 @@
 import torch
 import triton
 import triton.language as tl
+from torch.nn.attention import SDPBackend, sdpa_kernel
 
 
 class FlashAttentionFunc(torch.autograd.Function):
@@ -133,21 +134,21 @@ def flash_fwd_kernel(
         order=(0,),
     )
 
-    q_tile = tl.load(Q_block_ptr, boundary_check=(0, 1))  # [Q_TILE_SIZE, D]
+    q_tile = tl.load(Q_block_ptr, boundary_check=(0, 1)).to(tl.float32)  # [Q_TILE_SIZE, D]
     o_i = tl.zeros((Q_TILE_SIZE, D), dtype=tl.float32)  # [Q_TILE_SIZE, D]
     l_i = tl.zeros((q_tile.shape[0],), dtype=tl.float32)  # [Q_TILE_SIZE]
     m_i = tl.full((q_tile.shape[0],), float("-inf"), dtype=tl.float32)  # [Q_TILE_SIZE]
 
     for _ in range(0, N_KEYS, K_TILE_SIZE):
-        k_tile = tl.load(K_block_ptr, boundary_check=(0, 1))  # [K_TILE_SIZE, D]
-        v_tile = tl.load(V_block_ptr, boundary_check=(0, 1))  # [K_TILE_SIZE, D]
+        k_tile = tl.load(K_block_ptr, boundary_check=(0, 1)).to(tl.float32)  # [K_TILE_SIZE, D]
+        v_tile = tl.load(V_block_ptr, boundary_check=(0, 1)).to(tl.float32)  # [K_TILE_SIZE, D]
 
-        scores = tl.dot(q_tile, tl.trans(k_tile), allow_tf32=False) * scale  # [Q_TILE_SIZE, K_TILE_SIZE]
+        scores = tl.dot(q_tile, tl.trans(k_tile)) * scale  # [Q_TILE_SIZE, K_TILE_SIZE]
         m_ij = tl.maximum(m_i, scores.max(axis=1))  # [Q_TILE_SIZE]
 
         exp_scores = tl.exp(scores - m_ij[:, None])  # [Q_TILE_SIZE, K_TILE_SIZE]
         l_i = tl.exp(m_i - m_ij) * l_i + tl.sum(exp_scores, axis=1)  # [Q_TILE_SIZE]
-        o_i = tl.exp(m_i - m_ij)[:, None] * o_i + tl.dot(exp_scores, v_tile, allow_tf32=False)  # [Q_TILE_SIZE, D]
+        o_i = tl.exp(m_i - m_ij)[:, None] * o_i + tl.dot(exp_scores, v_tile)  # [Q_TILE_SIZE, D]
         m_i = m_ij
 
         K_block_ptr = K_block_ptr.advance((K_TILE_SIZE, 0))
@@ -155,7 +156,7 @@ def flash_fwd_kernel(
 
     o_i /= l_i[:, None]  # Store the output and the normalizer
 
-    tl.store(O_block_ptr, o_i, boundary_check=(0, 1))
+    tl.store(O_block_ptr, o_i.to(tl.bfloat16), boundary_check=(0, 1))
     tl.store(L_block_ptr, m_i + tl.math.log(l_i), boundary_check=(0,))
 
 
@@ -305,26 +306,26 @@ def flash_bwd_kernel(
         D_tile = tl.load(D_block_ptr, boundary_check=(0,))
 
         # S_i^(j) and P_i^(j)
-        qk = tl.dot(q, tl.trans(k), allow_tf32=False) * scale
+        qk = tl.dot(q, tl.trans(k)) * scale
         p = tl.exp(qk - l_tile[:, None])
 
         # dV(j) += P^T @ dO
-        dv += tl.dot(tl.trans(p), do, allow_tf32=False)
+        dv += tl.dot(tl.trans(p.to(q.dtype)), do)
 
         # dP and dS
-        dp = tl.dot(do, tl.trans(v), allow_tf32=False)
+        dp = tl.dot(do, tl.trans(v))
         ds = p * (dp - D_tile[:, None]) * scale
 
         # Atomic add dQ(i)
         offs_m = i + tl.arange(0, BLOCK_M)
         offs_d = tl.arange(0, D)
         dQ_ptrs = dQ_ptr + b * stride_dqb + h * stride_dqh + offs_m[:, None] * stride_dqn + offs_d[None, :] * stride_dqd
-        dq = tl.dot(ds, k, allow_tf32=False)
+        dq = tl.dot(ds.to(q.dtype), k)
         mask = (offs_m[:, None] < N) & (offs_d[None, :] < D)
         tl.atomic_add(dQ_ptrs, dq, mask=mask)
 
         # dK(j) += dS^T @ Q
-        dk += tl.dot(tl.trans(ds), q, allow_tf32=False)
+        dk += tl.dot(tl.trans(ds.to(q.dtype)), q)
 
         q_block_ptr = q_block_ptr.advance((BLOCK_M, 0))
         do_block_ptr = do_block_ptr.advance((BLOCK_M, 0))
@@ -348,8 +349,8 @@ def flash_bwd_kernel(
         block_shape=(BLOCK_N, D),
         order=(1, 0),
     )
-    tl.store(dk_block_ptr, dk, boundary_check=(0, 1))
-    tl.store(dv_block_ptr, dv, boundary_check=(0, 1))
+    tl.store(dk_block_ptr, dk.to(k.dtype), boundary_check=(0, 1))
+    tl.store(dv_block_ptr, dv.to(v.dtype), boundary_check=(0, 1))
 
 
 class TritonFlashAttnFunc(torch.autograd.Function):
@@ -363,7 +364,7 @@ class TritonFlashAttnFunc(torch.autograd.Function):
         ctx.Q_TILE_SIZE = 16
         ctx.K_TILE_SIZE = 16
 
-        out_final = torch.empty(bs, H, Nq, d, device=Q.device, dtype=torch.float32)
+        out_final = torch.empty_like(Q)
         l_final = torch.empty(bs, H, Nq, device=Q.device, dtype=torch.float32)
 
         flash_fwd_kernel[(triton.cdiv(Nq, ctx.Q_TILE_SIZE), bs * H)](
@@ -401,7 +402,7 @@ class TritonFlashAttnFunc(torch.autograd.Function):
         )
         # ctx.is_causal = is_causal
         ctx.save_for_backward(Q, K, V, out_final, l_final)
-        return out_final
+        return out_final.to(Q.dtype)
 
     @staticmethod
     def backward(ctx, do):
@@ -414,7 +415,7 @@ class TritonFlashAttnFunc(torch.autograd.Function):
 
         D = _rowsum(O, do)
 
-        dQ = torch.zeros_like(Q)
+        dQ = torch.zeros_like(Q, dtype=torch.float32)
         dK = torch.empty_like(K)
         dV = torch.empty_like(V)
 
@@ -434,9 +435,27 @@ class TritonFlashAttnFunc(torch.autograd.Function):
             D=d, BLOCK_M=BLOCK_M, BLOCK_N=BLOCK_N, NH=H,
         )
 
-        return dQ, dK, dV, None
+        return dQ.to(Q.dtype), dK.to(K.dtype), dV.to(V.dtype), None
 
-def test_timing_flash_forward_backward():
+def test_consistency():
+    x = torch.randn(4, 8, 32, 128, device="cuda", dtype=torch.bfloat16, requires_grad=True)
+    output = TritonFlashAttnFunc.apply(x, x, x)
+    actual = torch.nn.functional.scaled_dot_product_attention(x, x, x)
+    atol = 5e-2 if x.dtype == torch.bfloat16 else 1e-5
+    rtol = 5e-2 if x.dtype == torch.bfloat16 else 1e-5
+    torch.testing.assert_close(output, actual, atol=atol, rtol=rtol)
+
+    # backward
+    loss = output.sum()
+    loss.backward()
+    x_grad = x.grad.clone()
+    x.grad.zero_()
+    loss = actual.sum()
+    loss.backward()
+    torch.testing.assert_close(x.grad, x_grad, atol=atol, rtol=rtol)
+    print("Consistency test passed!")
+
+def test_timing():
     bs = 4
     n_heads = 16
     d_head = 64
@@ -451,39 +470,19 @@ def test_timing_flash_forward_backward():
         o = flash(q, k, v, True)
         loss = o.sum()
         loss.backward()
+    
+    def forward_backward():
+        with sdpa_kernel(SDPBackend.EFFICIENT_ATTENTION):
+            o = torch.nn.functional.scaled_dot_product_attention(q, k, v, attn_mask=None, dropout_p=0.0, is_causal=True)
+        loss = o.sum()
+        loss.backward()
 
-    results = triton.testing.do_bench(flash_forward_backward, rep=100, warmup=100)
+    results = triton.testing.do_bench(flash_forward_backward, rep=1000, warmup=100)
+    torch_result = triton.testing.do_bench(forward_backward, rep=1000, warmup=100)
     print(results)
+    print(torch_result)
 
 
 if __name__ == "__main__":
-    x = torch.randn(4, 8, 32, 128, device="cuda", dtype=torch.bfloat16, requires_grad=True)
-    output = TritonFlashAttnFunc.apply(x, x, x)
-    actual = torch.nn.functional.scaled_dot_product_attention(x, x, x)
-    torch.testing.assert_close(output, actual, atol=1e-5, rtol=1e-5)
-
-    loss = output.sum()
-    loss.backward()
-    x_grad = x.grad.clone()
-    x.grad.zero_()
-    loss = actual.sum()
-    loss.backward()
-    torch.testing.assert_close(x.grad, x_grad, atol=1e-5, rtol=1e-5)
-    # test_timing_flash_forward_backward()
-
-    # output = FlashAttentionFunc.apply(x, x, x)
-    # actual = torch.nn.functional.scaled_dot_product_attention(x, x, x)
-    # torch.testing.assert_close(output, actual, atol=1e-5, rtol=1e-5)
-
-    # custom_time = timeit.timeit(
-    #     "FlashAttentionFunc.apply(x, x, x)",
-    #     globals=globals(),
-    #     number=100,
-    # )
-    # torch_time = timeit.timeit(
-    #     "torch.nn.functional.scaled_dot_product_attention(x, x, x)",
-    #     globals=globals(),
-    #     number=100,
-    # )
-    # print(f"Custom FlashAttention time: {custom_time:.4f} seconds")
-    # print(f"PyTorch FlashAttention time: {torch_time:.4f} seconds")
+    test_consistency()
+    test_timing()
