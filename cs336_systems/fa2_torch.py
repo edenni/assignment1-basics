@@ -63,14 +63,14 @@ class FlashAttentionFunc(torch.autograd.Function):
 
 @triton.autotune(
     configs=[
-        triton.Config({"Q_TILE_SIZE": 16, "K_TILE_SIZE": 16}, num_warps=2, num_stages=1),
-        triton.Config({"Q_TILE_SIZE": 32, "K_TILE_SIZE": 32}, num_warps=4, num_stages=1),
-        triton.Config({"Q_TILE_SIZE": 64, "K_TILE_SIZE": 64}, num_warps=4, num_stages=1),
-        triton.Config({"Q_TILE_SIZE": 128, "K_TILE_SIZE": 64}, num_warps=4, num_stages=1),
-        triton.Config({"Q_TILE_SIZE": 64, "K_TILE_SIZE": 128}, num_warps=4, num_stages=1),
-        triton.Config({"Q_TILE_SIZE": 128, "K_TILE_SIZE": 128}, num_warps=8, num_stages=1),
-        triton.Config({"Q_TILE_SIZE": 32, "K_TILE_SIZE": 64}, num_warps=4, num_stages=1),
-        triton.Config({"Q_TILE_SIZE": 64, "K_TILE_SIZE": 32}, num_warps=4, num_stages=1),
+        triton.Config({"Q_TILE_SIZE": 64, "K_TILE_SIZE": 64}, num_warps=4, num_stages=2),
+        triton.Config({"Q_TILE_SIZE": 128, "K_TILE_SIZE": 64}, num_warps=4, num_stages=2),
+        triton.Config({"Q_TILE_SIZE": 128, "K_TILE_SIZE": 64}, num_warps=8, num_stages=2),
+        triton.Config({"Q_TILE_SIZE": 128, "K_TILE_SIZE": 128}, num_warps=8, num_stages=2),
+        triton.Config({"Q_TILE_SIZE": 64, "K_TILE_SIZE": 64}, num_warps=4, num_stages=3),
+        triton.Config({"Q_TILE_SIZE": 128, "K_TILE_SIZE": 64}, num_warps=4, num_stages=3),
+        triton.Config({"Q_TILE_SIZE": 128, "K_TILE_SIZE": 64}, num_warps=8, num_stages=3),
+        triton.Config({"Q_TILE_SIZE": 128, "K_TILE_SIZE": 128}, num_warps=8, num_stages=3),
     ],
     key=["N_QUERIES", "N_KEYS", "D"],
 )
@@ -158,33 +158,34 @@ def flash_fwd_kernel(
         order=(0,),
     )
 
-    q_tile = tl.load(Q_block_ptr, boundary_check=(0, 1)).to(tl.float32)  # [Q_TILE_SIZE, D]
-    o_i = tl.zeros((Q_TILE_SIZE, D), dtype=tl.float32)  # [Q_TILE_SIZE, D]
-    l_i = tl.zeros((q_tile.shape[0],), dtype=tl.float32)  # [Q_TILE_SIZE]
-    m_i = tl.full((q_tile.shape[0],), float("-inf"), dtype=tl.float32)  # [Q_TILE_SIZE]
+    q_tile = tl.load(Q_block_ptr, boundary_check=(0, 1))  # [Q_TILE_SIZE, D] bf16
+    o_i = tl.zeros((Q_TILE_SIZE, D), dtype=tl.float32)
+    l_i = tl.zeros((Q_TILE_SIZE,), dtype=tl.float32)
+    m_i = tl.full((Q_TILE_SIZE,), float("-inf"), dtype=tl.float32)
 
     if IS_CAUSAL:
         kv_end = tl.minimum(N_KEYS, (query_tile_index + 1) * Q_TILE_SIZE)
     else:
         kv_end = N_KEYS
 
-    
     for j in range(0, kv_end, K_TILE_SIZE):
-        k_tile = tl.load(K_block_ptr, boundary_check=(0, 1)).to(tl.float32)  # [K_TILE_SIZE, D]
-        v_tile = tl.load(V_block_ptr, boundary_check=(0, 1)).to(tl.float32)  # [K_TILE_SIZE, D]
+        k_tile = tl.load(K_block_ptr, boundary_check=(0, 1))  # [K_TILE_SIZE, D] bf16
+        v_tile = tl.load(V_block_ptr, boundary_check=(0, 1))  # [K_TILE_SIZE, D] bf16
 
-        scores = tl.dot(q_tile, tl.trans(k_tile)) * scale  # [Q_TILE_SIZE, K_TILE_SIZE]
+        # bf16 x bf16 dot -> fp32 accumulation (tensor cores)
+        scores = tl.dot(q_tile, tl.trans(k_tile)) * scale
 
         if IS_CAUSAL:
             row_idx = query_tile_index * Q_TILE_SIZE + tl.arange(0, Q_TILE_SIZE)
             col_idx = j + tl.arange(0, K_TILE_SIZE)
             scores = tl.where(row_idx[:, None] >= col_idx[None, :], scores, float("-inf"))
 
-        m_ij = tl.maximum(m_i, scores.max(axis=1))  # [Q_TILE_SIZE]
+        m_ij = tl.maximum(m_i, scores.max(axis=1))
 
-        exp_scores = tl.exp(scores - m_ij[:, None])  # [Q_TILE_SIZE, K_TILE_SIZE]
-        l_i = tl.exp(m_i - m_ij) * l_i + tl.sum(exp_scores, axis=1)  # [Q_TILE_SIZE]
-        o_i = tl.exp(m_i - m_ij)[:, None] * o_i + tl.dot(exp_scores, v_tile)  # [Q_TILE_SIZE, D]
+        exp_scores = tl.exp(scores - m_ij[:, None])
+        l_i = tl.exp(m_i - m_ij) * l_i + tl.sum(exp_scores, axis=1)
+        # Cast exp_scores to bf16 for tensor core dot with v_tile
+        o_i = tl.exp(m_i - m_ij)[:, None] * o_i + tl.dot(exp_scores.to(tl.bfloat16), v_tile)
         m_i = m_ij
 
         K_block_ptr = K_block_ptr.advance((K_TILE_SIZE, 0))
@@ -228,10 +229,14 @@ def _flash_bwd_kernel_torch(q, k, v, o, do, l, is_causal=False):
 ############################
 @triton.autotune(
     configs=[
-        triton.Config({"BLOCK_M": 16, "BLOCK_N": 16}, num_warps=2, num_stages=1),
-        triton.Config({"BLOCK_M": 32, "BLOCK_N": 32}, num_warps=4, num_stages=1),
-        triton.Config({"BLOCK_M": 64, "BLOCK_N": 64}, num_warps=4, num_stages=1),
-        triton.Config({"BLOCK_M": 128, "BLOCK_N": 128}, num_warps=8, num_stages=1),
+        triton.Config({"BLOCK_M": 64, "BLOCK_N": 64}, num_warps=4, num_stages=2),
+        triton.Config({"BLOCK_M": 128, "BLOCK_N": 64}, num_warps=4, num_stages=2),
+        triton.Config({"BLOCK_M": 128, "BLOCK_N": 64}, num_warps=8, num_stages=2),
+        triton.Config({"BLOCK_M": 128, "BLOCK_N": 128}, num_warps=8, num_stages=2),
+        triton.Config({"BLOCK_M": 64, "BLOCK_N": 64}, num_warps=4, num_stages=3),
+        triton.Config({"BLOCK_M": 128, "BLOCK_N": 64}, num_warps=4, num_stages=3),
+        triton.Config({"BLOCK_M": 128, "BLOCK_N": 64}, num_warps=8, num_stages=3),
+        triton.Config({"BLOCK_M": 128, "BLOCK_N": 128}, num_warps=8, num_stages=3),
     ],
     key=["N", "D"],
 )
@@ -304,10 +309,10 @@ def flash_bwd_dq_kernel(
         kv_end = N
 
     for j in range(0, kv_end, BLOCK_N):
-        k = tl.load(k_block_ptr, boundary_check=(0, 1))
-        v = tl.load(v_block_ptr, boundary_check=(0, 1))
+        k = tl.load(k_block_ptr, boundary_check=(0, 1))  # bf16
+        v = tl.load(v_block_ptr, boundary_check=(0, 1))  # bf16
 
-        qk = tl.dot(q, tl.trans(k)) * scale
+        qk = tl.dot(q, tl.trans(k)) * scale  # bf16 x bf16 -> fp32
 
         if IS_CAUSAL:
             row_idx = pid_m * BLOCK_M + tl.arange(0, BLOCK_M)
@@ -316,10 +321,10 @@ def flash_bwd_dq_kernel(
 
         p = tl.exp(qk - l_tile[:, None])
 
-        dp = tl.dot(do, tl.trans(v))
+        dp = tl.dot(do, tl.trans(v))  # bf16 x bf16 -> fp32
         ds = p * (dp - D_tile[:, None]) * scale
 
-        dq += tl.dot(ds.to(q.dtype), k)
+        dq += tl.dot(ds.to(tl.bfloat16), k)  # bf16 x bf16 -> fp32
 
         k_block_ptr = k_block_ptr.advance((BLOCK_N, 0))
         v_block_ptr = v_block_ptr.advance((BLOCK_N, 0))
@@ -339,10 +344,14 @@ def flash_bwd_dq_kernel(
 ############################
 @triton.autotune(
     configs=[
-        triton.Config({"BLOCK_M": 16, "BLOCK_N": 16}, num_warps=2, num_stages=1),
-        triton.Config({"BLOCK_M": 32, "BLOCK_N": 32}, num_warps=4, num_stages=1),
-        triton.Config({"BLOCK_M": 64, "BLOCK_N": 64}, num_warps=4, num_stages=1),
-        triton.Config({"BLOCK_M": 128, "BLOCK_N": 128}, num_warps=8, num_stages=1),
+        triton.Config({"BLOCK_M": 64, "BLOCK_N": 64}, num_warps=4, num_stages=2),
+        triton.Config({"BLOCK_M": 128, "BLOCK_N": 64}, num_warps=4, num_stages=2),
+        triton.Config({"BLOCK_M": 128, "BLOCK_N": 64}, num_warps=8, num_stages=2),
+        triton.Config({"BLOCK_M": 128, "BLOCK_N": 128}, num_warps=8, num_stages=2),
+        triton.Config({"BLOCK_M": 64, "BLOCK_N": 64}, num_warps=4, num_stages=3),
+        triton.Config({"BLOCK_M": 128, "BLOCK_N": 64}, num_warps=4, num_stages=3),
+        triton.Config({"BLOCK_M": 128, "BLOCK_N": 64}, num_warps=8, num_stages=3),
+        triton.Config({"BLOCK_M": 128, "BLOCK_N": 128}, num_warps=8, num_stages=3),
     ],
     key=["N", "D"],
 )
@@ -418,12 +427,12 @@ def flash_bwd_dkdv_kernel(
         loop_start = 0
 
     for i in range(loop_start, N, BLOCK_M):
-        q = tl.load(q_block_ptr, boundary_check=(0, 1))
-        do = tl.load(do_block_ptr, boundary_check=(0, 1))
+        q = tl.load(q_block_ptr, boundary_check=(0, 1))  # bf16
+        do = tl.load(do_block_ptr, boundary_check=(0, 1))  # bf16
         l_tile = tl.load(l_block_ptr, boundary_check=(0,))
         D_tile = tl.load(D_block_ptr, boundary_check=(0,))
 
-        qk = tl.dot(q, tl.trans(k)) * scale
+        qk = tl.dot(q, tl.trans(k)) * scale  # bf16 x bf16 -> fp32
 
         if IS_CAUSAL:
             row_idx = i + tl.arange(0, BLOCK_M)
@@ -432,15 +441,15 @@ def flash_bwd_dkdv_kernel(
 
         p = tl.exp(qk - l_tile[:, None])
 
-        # dV(j) += P^T @ dO
-        dv += tl.dot(tl.trans(p.to(q.dtype)), do)
+        # dV(j) += P^T @ dO — cast p to bf16 for tensor cores
+        dv += tl.dot(tl.trans(p.to(tl.bfloat16)), do)
 
         # dP and dS
-        dp = tl.dot(do, tl.trans(v))
+        dp = tl.dot(do, tl.trans(v))  # bf16 x bf16 -> fp32
         ds = p * (dp - D_tile[:, None]) * scale
 
-        # dK(j) += dS^T @ Q
-        dk += tl.dot(tl.trans(ds.to(q.dtype)), q)
+        # dK(j) += dS^T @ Q — cast ds to bf16 for tensor cores
+        dk += tl.dot(tl.trans(ds.to(tl.bfloat16)), q)
 
         q_block_ptr = q_block_ptr.advance((BLOCK_M, 0))
         do_block_ptr = do_block_ptr.advance((BLOCK_M, 0))
@@ -599,7 +608,7 @@ def test_timing():
         loss.backward()
     
     def forward_backward():
-        with sdpa_kernel(SDPBackend.EFFICIENT_ATTENTION):
+        with sdpa_kernel(SDPBackend.FLASH_ATTENTION):
             o = torch.nn.functional.scaled_dot_product_attention(q, k, v, attn_mask=None, dropout_p=0.0, is_causal=True)
         loss = o.sum()
         loss.backward()
