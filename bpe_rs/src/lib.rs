@@ -428,8 +428,9 @@ struct Tokenizer {
     ac: Option<AhoCorasick>,
     // compiled pretokenization regex (one instance; single-threaded encode)
     re: Regex,
-    // cache: pretoken bytes -> encoded ids (thread-unsafe; only used from Python GIL-held calls)
-    cache: std::cell::RefCell<AHashMap<Vec<u8>, Vec<u32>>>,
+    // cache: pretoken bytes -> encoded ids. Uses Mutex to be Sync (parallel
+    // encode_file does NOT touch this — each thread has its own cache).
+    cache: std::sync::Mutex<AHashMap<Vec<u8>, Vec<u32>>>,
 }
 
 fn bytes_pair_order(a: &[u8], b: &[u8]) -> std::cmp::Ordering {
@@ -622,7 +623,14 @@ impl Tokenizer {
         out
     }
 
-    fn encode_chunk_impl(&self, text: &str, min_heap: bool, out: &mut Vec<u32>) {
+    fn encode_chunk_with(
+        &self,
+        text: &str,
+        min_heap: bool,
+        re: &Regex,
+        cache: &mut AHashMap<Vec<u8>, Vec<u32>>,
+        out: &mut Vec<u32>,
+    ) {
         // Fast path: if the whole chunk equals a special token, emit its id
         if !self.special_tokens.is_empty() {
             let tb = text.as_bytes();
@@ -636,15 +644,11 @@ impl Tokenizer {
             }
         }
 
-        for m in self.re.find_iter(text).flatten() {
+        for m in re.find_iter(text).flatten() {
             let piece = &text.as_bytes()[m.start()..m.end()];
-            // Cache lookup
-            {
-                let cache = self.cache.borrow();
-                if let Some(ids) = cache.get(piece) {
-                    out.extend_from_slice(ids);
-                    continue;
-                }
+            if let Some(ids) = cache.get(piece) {
+                out.extend_from_slice(ids);
+                continue;
             }
             let ids = if min_heap {
                 self.bpe_heap(piece)
@@ -652,7 +656,34 @@ impl Tokenizer {
                 self.bpe_sequential(piece)
             };
             out.extend_from_slice(&ids);
-            self.cache.borrow_mut().insert(piece.to_vec(), ids);
+            cache.insert(piece.to_vec(), ids);
+        }
+    }
+
+    fn encode_text_with(
+        &self,
+        text: &str,
+        min_heap: bool,
+        re: &Regex,
+        cache: &mut AHashMap<Vec<u8>, Vec<u32>>,
+        out: &mut Vec<u32>,
+    ) {
+        match &self.ac {
+            None => self.encode_chunk_with(text, min_heap, re, cache, out),
+            Some(ac) => {
+                let bytes = text.as_bytes();
+                let mut prev = 0usize;
+                for m in ac.find_iter(bytes) {
+                    if m.start() > prev {
+                        self.encode_chunk_with(&text[prev..m.start()], min_heap, re, cache, out);
+                    }
+                    self.encode_chunk_with(&text[m.start()..m.end()], min_heap, re, cache, out);
+                    prev = m.end();
+                }
+                if prev < bytes.len() {
+                    self.encode_chunk_with(&text[prev..], min_heap, re, cache, out);
+                }
+            }
         }
     }
 }
@@ -739,34 +770,137 @@ impl Tokenizer {
             special_tokens: specials,
             ac,
             re,
-            cache: std::cell::RefCell::new(AHashMap::new()),
+            cache: std::sync::Mutex::new(AHashMap::new()),
         })
     }
 
     #[pyo3(signature = (text, min_heap=false))]
     fn encode(&self, text: &str, min_heap: bool) -> Vec<u32> {
         let mut out: Vec<u32> = Vec::new();
-        match &self.ac {
-            None => self.encode_chunk_impl(text, min_heap, &mut out),
-            Some(ac) => {
-                let bytes = text.as_bytes();
-                let mut prev = 0usize;
-                for m in ac.find_iter(bytes) {
-                    if m.start() > prev {
-                        let sub = &text[prev..m.start()];
-                        self.encode_chunk_impl(sub, min_heap, &mut out);
-                    }
-                    let sub = &text[m.start()..m.end()];
-                    self.encode_chunk_impl(sub, min_heap, &mut out);
-                    prev = m.end();
+        let mut cache = self.cache.lock().expect("cache mutex poisoned");
+        self.encode_text_with(text, min_heap, &self.re, &mut cache, &mut out);
+        out
+    }
+
+    /// Encode an entire file in parallel, returning a numpy uint16 array.
+    ///
+    /// Steps:
+    /// 1. mmap `input_path`.
+    /// 2. Split into chunks on `<|endoftext|>` (or first special token)
+    ///    boundaries via AhoCorasick — boundaries never fall inside a
+    ///    pretoken, so per-chunk encoding gives the same ids as whole-file.
+    /// 3. Parallel encode each chunk via rayon with per-thread `Regex`
+    ///    and per-thread pretoken cache.
+    /// 4. Concatenate into a single `Vec<u16>` (downcast from u32).
+    #[pyo3(signature = (input_path, min_heap=false, num_threads=0))]
+    fn encode_file<'py>(
+        &self,
+        py: Python<'py>,
+        input_path: &str,
+        min_heap: bool,
+        num_threads: usize,
+    ) -> PyResult<Bound<'py, numpy::PyArray1<u16>>> {
+        use numpy::IntoPyArray;
+
+        let file = File::open(input_path).map_err(|e| {
+            pyo3::exceptions::PyIOError::new_err(format!("open {}: {}", input_path, e))
+        })?;
+        let mmap = unsafe { Mmap::map(&file) }
+            .map_err(|e| pyo3::exceptions::PyIOError::new_err(format!("mmap: {}", e)))?;
+        let data: &[u8] = &mmap;
+
+        // If vocab size > 65535, uint16 is insufficient
+        if self.id_to_bytes.len() > u16::MAX as usize + 1 {
+            return Err(pyo3::exceptions::PyOverflowError::new_err(
+                "vocab size exceeds u16::MAX; use a wider dtype",
+            ));
+        }
+
+        let threads = if num_threads == 0 {
+            rayon::current_num_threads()
+        } else {
+            num_threads
+        };
+        // Choose chunk boundaries on special-token occurrences so each chunk
+        // is a whole multiple of documents. One chunk per document would be
+        // too many (owt = millions of docs), so we merge consecutive docs
+        // until each chunk is ~file_size / (threads * 64) bytes — plenty for
+        // work-stealing without excessive overhead.
+        let split_token: &[u8] = if self.special_tokens.is_empty() {
+            b"<|endoftext|>"
+        } else {
+            &self.special_tokens[0]
+        };
+        let target_chunks = (threads * 64).max(1);
+        let target_bytes = (data.len() / target_chunks).max(1 << 20); // at least 1MB
+
+        let mut ranges: Vec<(usize, usize)> = Vec::new();
+        let mut start = 0usize;
+        let finder = memmem::Finder::new(split_token);
+        let mut cursor = 0usize;
+        while cursor < data.len() {
+            let desired_end = (start + target_bytes).min(data.len());
+            if desired_end >= data.len() {
+                ranges.push((start, data.len()));
+                break;
+            }
+            match finder.find(&data[desired_end..]) {
+                Some(off) => {
+                    // end chunk just after the special token so boundary
+                    // lands at a safe split point
+                    let end = desired_end + off + split_token.len();
+                    ranges.push((start, end));
+                    start = end;
+                    cursor = end;
                 }
-                if prev < bytes.len() {
-                    let sub = &text[prev..];
-                    self.encode_chunk_impl(sub, min_heap, &mut out);
+                None => {
+                    ranges.push((start, data.len()));
+                    break;
                 }
             }
         }
-        out
+        if ranges.is_empty() {
+            ranges.push((0, data.len()));
+        }
+
+        let pool = rayon::ThreadPoolBuilder::new()
+            .num_threads(if num_threads == 0 { 0 } else { threads })
+            .build()
+            .map_err(|e| {
+                pyo3::exceptions::PyRuntimeError::new_err(format!("rayon pool: {}", e))
+            })?;
+
+        let per_chunk: Vec<Vec<u16>> = py.allow_threads(|| {
+            pool.install(|| {
+                ranges
+                    .par_iter()
+                    .map_init(
+                        || {
+                            (
+                                Regex::new(PAT).expect("regex compile"),
+                                AHashMap::<Vec<u8>, Vec<u32>>::new(),
+                            )
+                        },
+                        |(re, cache), &(s, e)| {
+                            let slice = &data[s..e];
+                            let text = std::str::from_utf8(slice)
+                                .map(std::borrow::Cow::Borrowed)
+                                .unwrap_or_else(|_| String::from_utf8_lossy(slice));
+                            let mut ids: Vec<u32> = Vec::new();
+                            self.encode_text_with(&text, min_heap, re, cache, &mut ids);
+                            ids.into_iter().map(|x| x as u16).collect()
+                        },
+                    )
+                    .collect()
+            })
+        });
+
+        let total: usize = per_chunk.iter().map(|v| v.len()).sum();
+        let mut flat: Vec<u16> = Vec::with_capacity(total);
+        for v in per_chunk {
+            flat.extend_from_slice(&v);
+        }
+        Ok(flat.into_pyarray_bound(py))
     }
 
     fn decode(&self, py: Python<'_>, ids: Vec<u32>) -> PyResult<Py<pyo3::types::PyString>> {

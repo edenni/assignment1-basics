@@ -1,33 +1,29 @@
+import os
 from pathlib import Path
 
 import numpy as np
-from tqdm import tqdm
 
-from cs336_basics.tokenizer import Tokenizer
+from cs336_basics.rust_tokenizer import RustTokenizer as Tokenizer
 
-data_path = dict(train="data/TinyStoriesV2-GPT4-train.txt", val="data/TinyStoriesV2-GPT4-valid.txt")
-vocab_filepath = "outputs/tinystories_vocab.json"
-merges_filepath = "outputs/tinystories_merges.txt"
+data_path = dict(train="data/owt_train.txt", val="data/owt_valid.txt")
+vocab_filepath = "outputs/owt_vocab.json"
+merges_filepath = "outputs/owt_merges.txt"
 special_tokens = ["<|endoftext|>"]
-dataset_name = "tinystories"
-output_dir = "data/tinystories"
+output_dir = "data/owt"
 
 Path(output_dir).mkdir(parents=True, exist_ok=True)
 
 tokenizer = Tokenizer.from_files(vocab_filepath, merges_filepath, special_tokens)
 
-for split in ["train", "val"]:
-    with open(data_path[split], encoding='utf-8') as f:
-        text = f.read()
-    encoded = tokenizer.encode(text)
+num_threads = int(os.environ.get("BPE_THREADS", os.cpu_count() or 1))
 
-    # save the ids
-    total_chunks = 1024
-    chunk_size = len(encoded) // total_chunks
-    arr = np.memmap(f"data/tinystories/{split}.bin", dtype=np.uint16, mode="w+", shape=(len(encoded),))
-    idx = 0
-    for batch_idx in tqdm(range(total_chunks), desc=f"Writing {split}.bin"):
-        batch = encoded[idx : idx + chunk_size]
-        arr[idx : idx + chunk_size] = batch
-        idx += chunk_size
-arr.flush()
+for split in ["train", "val"]:
+    out_path = f"{output_dir}/{split}.bin"
+    ids = tokenizer.encode_file(
+        data_path[split], min_heap=True, num_threads=num_threads
+    )
+    arr = np.memmap(out_path, dtype=np.uint16, mode="w+", shape=(len(ids),))
+    arr[:] = ids
+    arr.flush()
+    del arr
+    print(f"{split}: wrote {len(ids):,} tokens to {out_path}")
