@@ -1,0 +1,13 @@
+[build-system]
+requires = ["maturin>=1.7,<2.0"]
+build-backend = "maturin"
+
+[project]
+name = "bpe_rs"
+version = "0.1.0"
+requires-python = ">=3.11"
+description = "Rust-accelerated BPE pretokenization + merge loop for cs336_basics"
+
+[tool.maturin]
+module-name = "bpe_rs"
+bindings = "pyo3"

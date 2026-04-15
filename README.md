@@ -19,6 +19,17 @@ uv run <python_file_path>
 ```
 and the environment will be automatically solved and activated when necessary.
 
+### Build Rust extension (`bpe_rs`)
+
+`cs336_basics.train_bpe` delegates pretokenization and the merge loop to a Rust
+extension built with maturin. Build and install it into the project venv:
+
+```sh
+uv pip install maturin
+# Rust toolchain required: https://rustup.rs
+VIRTUAL_ENV=$PWD/.venv .venv/bin/maturin develop --release --manifest-path bpe_rs/Cargo.toml
+```
+
 ### Run unit tests
 
 

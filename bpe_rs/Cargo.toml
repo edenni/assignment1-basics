@@ -1,0 +1,20 @@
+[package]
+name = "bpe_rs"
+version = "0.1.0"
+edition = "2021"
+
+[lib]
+name = "bpe_rs"
+crate-type = ["cdylib"]
+
+[dependencies]
+pyo3 = { version = "0.22", features = ["extension-module"] }
+ahash = "0.8"
+fancy-regex = "0.13"
+rayon = "1.10"
+memmap2 = "0.9"
+
+[profile.release]
+lto = true
+codegen-units = 1
+opt-level = 3
