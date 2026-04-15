@@ -1,5 +1,8 @@
 use ahash::{AHashMap, AHashSet};
+use aho_corasick::AhoCorasick;
+use compact_str::CompactString;
 use fancy_regex::Regex;
+use memchr::memmem;
 use memmap2::Mmap;
 use pyo3::prelude::*;
 use pyo3::types::{PyBytes, PyDict};
@@ -42,69 +45,46 @@ fn find_subslice(hay: &[u8], needle: &[u8]) -> Option<usize> {
     if needle.is_empty() || needle.len() > hay.len() {
         return None;
     }
-    hay.windows(needle.len()).position(|w| w == needle)
+    memmem::find(hay, needle)
 }
 
-fn split_on_any<'a>(text: &'a str, seps: &[String]) -> Vec<&'a str> {
-    if seps.is_empty() {
-        return vec![text];
-    }
-    // find all occurrences of any separator, then split
-    let mut cuts: Vec<(usize, usize)> = Vec::new();
-    for sep in seps {
-        let sb = sep.as_bytes();
-        let bytes = text.as_bytes();
-        let mut i = 0;
-        while i + sb.len() <= bytes.len() {
-            if &bytes[i..i + sb.len()] == sb {
-                cuts.push((i, i + sb.len()));
-                i += sb.len();
-            } else {
-                i += 1;
-            }
-        }
-    }
-    if cuts.is_empty() {
-        return vec![text];
-    }
-    cuts.sort_unstable_by_key(|c| c.0);
-    // remove overlapping cuts (keep earlier)
-    let mut merged: Vec<(usize, usize)> = Vec::with_capacity(cuts.len());
-    for (s, e) in cuts {
-        if let Some(last) = merged.last() {
-            if s < last.1 {
-                continue;
-            }
-        }
-        merged.push((s, e));
-    }
-    let mut out = Vec::with_capacity(merged.len() + 1);
+/// Iterate byte-ranges between occurrences of any separator in `seps`.
+/// Yields &str slices pointing into `text`. Empty slices are skipped.
+fn split_on_any<'a>(text: &'a str, ac: Option<&AhoCorasick>) -> Vec<&'a str> {
+    let Some(ac) = ac else {
+        return if text.is_empty() { vec![] } else { vec![text] };
+    };
+    let bytes = text.as_bytes();
+    let mut out: Vec<&str> = Vec::new();
     let mut prev = 0usize;
-    for (s, e) in merged {
-        out.push(&text[prev..s]);
-        prev = e;
+    for m in ac.find_iter(bytes) {
+        if m.start() > prev {
+            out.push(&text[prev..m.start()]);
+        }
+        prev = m.end();
     }
-    out.push(&text[prev..]);
+    if prev < bytes.len() {
+        out.push(&text[prev..]);
+    }
     out
 }
 
-fn count_chunk(chunk: &str, seps: &[String], re: &Regex) -> AHashMap<Vec<u8>, u64> {
-    let mut counts: AHashMap<Vec<u8>, u64> = AHashMap::new();
-    for sub in split_on_any(chunk, seps) {
-        let mut last_end = 0;
+fn count_chunk(
+    chunk: &str,
+    ac: Option<&AhoCorasick>,
+    re: &Regex,
+    counts: &mut AHashMap<CompactString, u64>,
+) {
+    for sub in split_on_any(chunk, ac) {
         for m in re.find_iter(sub).flatten() {
-            // fancy_regex returns Result<Match>; flatten skips errors
-            let start = m.start();
-            let end = m.end();
-            if start < last_end {
-                continue;
+            let piece = &sub[m.start()..m.end()];
+            if let Some(v) = counts.get_mut(piece) {
+                *v += 1;
+            } else {
+                counts.insert(CompactString::from(piece), 1);
             }
-            let bytes = sub.as_bytes()[start..end].to_vec();
-            *counts.entry(bytes).or_insert(0) += 1;
-            last_end = end;
         }
     }
-    counts
 }
 
 #[pyfunction]
@@ -128,7 +108,9 @@ fn pretokenize_file(
     } else {
         num_threads
     };
-    let desired = (threads * 4).max(1);
+    // More chunks than threads improves work-stealing and keeps each
+    // chunk's working set closer to cache size for big files.
+    let desired = (threads * 16).max(1);
     let split_token: &[u8] = if special_tokens.is_empty() {
         b"<|endoftext|>"
     } else {
@@ -136,39 +118,58 @@ fn pretokenize_file(
     };
     let boundaries = find_chunk_boundaries(data, desired, split_token);
 
+    let ac = if special_tokens.is_empty() {
+        None
+    } else {
+        Some(
+            AhoCorasick::new(special_tokens.iter().map(|s| s.as_bytes()))
+                .expect("aho-corasick build"),
+        )
+    };
+
+    let pool = rayon::ThreadPoolBuilder::new()
+        .num_threads(if num_threads == 0 { 0 } else { threads })
+        .build()
+        .map_err(|e| pyo3::exceptions::PyRuntimeError::new_err(format!("rayon pool: {}", e)))?;
+
     let merged = py.allow_threads(|| {
-        let re = Regex::new(PAT).expect("regex compile");
         let ranges: Vec<(usize, usize)> = boundaries
             .windows(2)
             .map(|w| (w[0], w[1]))
             .collect();
-        let per_chunk: Vec<AHashMap<Vec<u8>, u64>> = ranges
+        pool.install(|| ranges
             .par_iter()
-            .map(|&(s, e)| {
-                let slice = &data[s..e];
-                let text = std::str::from_utf8(slice)
-                    .map(std::borrow::Cow::Borrowed)
-                    .unwrap_or_else(|_| String::from_utf8_lossy(slice));
-                count_chunk(&text, &special_tokens, &re)
-            })
-            .collect();
-        let mut out: AHashMap<Vec<u8>, u64> = AHashMap::new();
-        for m in per_chunk {
-            if out.is_empty() {
-                out = m;
-            } else {
-                for (k, v) in m {
-                    *out.entry(k).or_insert(0) += v;
-                }
-            }
-        }
-        out
+            .map_init(
+                || Regex::new(PAT).expect("regex compile"),
+                |re, &(s, e)| {
+                    let slice = &data[s..e];
+                    let text = std::str::from_utf8(slice)
+                        .map(std::borrow::Cow::Borrowed)
+                        .unwrap_or_else(|_| String::from_utf8_lossy(slice));
+                    let mut local: AHashMap<CompactString, u64> = AHashMap::new();
+                    count_chunk(&text, ac.as_ref(), re, &mut local);
+                    local
+                },
+            )
+            .reduce(
+                AHashMap::<CompactString, u64>::new,
+                |mut a, mut b| {
+                    // Always merge smaller into larger to minimize work.
+                    if a.len() < b.len() {
+                        std::mem::swap(&mut a, &mut b);
+                    }
+                    for (k, v) in b {
+                        *a.entry(k).or_insert(0) += v;
+                    }
+                    a
+                },
+            ))
     });
 
-    // Build Python dict
+
     let dict = PyDict::new_bound(py);
     for (k, v) in merged {
-        let key = PyBytes::new_bound(py, &k);
+        let key = PyBytes::new_bound(py, k.as_bytes());
         dict.set_item(key, v)?;
     }
     Ok(dict.into())

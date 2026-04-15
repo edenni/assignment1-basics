@@ -13,6 +13,9 @@ ahash = "0.8"
 fancy-regex = "0.13"
 rayon = "1.10"
 memmap2 = "0.9"
+memchr = "2.7"
+compact_str = "0.8"
+aho-corasick = "1.1"
 
 [profile.release]
 lto = true
