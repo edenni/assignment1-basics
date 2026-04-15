@@ -92,14 +92,18 @@ class Tokenizer:
     def vocab_size(self) -> int:
         return len(self.vocab)
 
+    @classmethod
+    def train_from_file(cls, input_path: str, vocab_size: int, special_tokens: list[str], num_processes: int = 1, use_rust = True):
+        vocab, merges = train_bpe(input_path, vocab_size, special_tokens, use_rust)
+        return cls(vocab, merges, special_tokens)
 
 if __name__ == "__main__":
     input_path = "./data/TinyStoriesV2-GPT4-valid.txt"
     vocab_size = 5000
     special_tokens = ["<|endoftext|>"]
 
-    vocab, merges = train_bpe(input_path, vocab_size, special_tokens)
-    tokenizer = Tokenizer(vocab, merges, special_tokens)
+    # vocab, merges = train_bpe(input_path, vocab_size, special_tokens)
+    tokenizer = Tokenizer.train_from_file(input_path, vocab_size, special_tokens)
     inp = tokenizer.encode("hello world<|endoftext|>")
     print(inp)
     print(tokenizer.decode(inp))
