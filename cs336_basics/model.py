@@ -169,7 +169,7 @@ class MultiHeadSelfAttention(nn.Module):
             self.rope = None
         self.dropout = dropout
 
-    def forward(self, x, token_positions=None):
+    def forward(self, x, token_positions=None, kv_cache=None):
         B, L, D = x.size()
         q = self.q_proj(x).view(B, L, self.num_heads, self.d_head).transpose(1, 2).contiguous()
         k = self.k_proj(x).view(B, L, self.num_kv_heads, self.d_head).transpose(1, 2).contiguous()
@@ -179,15 +179,30 @@ class MultiHeadSelfAttention(nn.Module):
             q = self.rope(q, token_positions)
             k = self.rope(k, token_positions)
 
-        # expand KV heads to match Q heads: (B, num_kv_heads, L, d) -> (B, num_heads, L, d)
-        if self.num_groups > 1:
-            k = k.unsqueeze(2).expand(-1, -1, self.num_groups, -1, -1).reshape(B, self.num_heads, L, self.d_head).contiguous()
-            v = v.unsqueeze(2).expand(-1, -1, self.num_groups, -1, -1).reshape(B, self.num_heads, L, self.d_head).contiguous()
+        # append to KV cache if provided
+        if kv_cache is not None:
+            cached_k, cached_v = kv_cache
+            k = torch.cat([cached_k, k], dim=2)
+            v = torch.cat([cached_v, v], dim=2)
+        new_kv_cache = (k, v)
 
-        y = TritonFlashAttnFunc.apply(q, k, v, True)
+        # expand KV heads to match Q heads: (B, num_kv_heads, S, d) -> (B, num_heads, S, d)
+        S = k.size(2)
+        k_exp, v_exp = k, v
+        if self.num_groups > 1:
+            k_exp = k.unsqueeze(2).expand(-1, -1, self.num_groups, -1, -1).reshape(B, self.num_heads, S, self.d_head).contiguous()
+            v_exp = v.unsqueeze(2).expand(-1, -1, self.num_groups, -1, -1).reshape(B, self.num_heads, S, self.d_head).contiguous()
+
+        if kv_cache is not None:
+            # single-token decode: use simple matmul attention (flash attention overhead not worth it for L=1)
+            att = (q @ k_exp.transpose(-2, -1)) * (1.0 / math.sqrt(self.d_head))
+            y = torch.softmax(att, dim=-1) @ v_exp
+        else:
+            y = TritonFlashAttnFunc.apply(q, k_exp, v_exp, True)
+
         y = y.transpose(1, 2).contiguous().view(B, L, D)
         o = self.o_proj(y)
-        return o
+        return o, new_kv_cache
 
 
 class TransformerBlock(nn.Module):
@@ -211,16 +226,16 @@ class TransformerBlock(nn.Module):
         self.do1 = Dropout(dropout)
         self.do2 = Dropout(dropout)
 
-    def forward(self, x):
+    def forward(self, x, token_positions=None, kv_cache=None):
         y = self.ln1(x)
-        y = self.attn(y)
+        y, new_kv_cache = self.attn(y, token_positions, kv_cache)
         y = self.do1(y)
         x = x + y
         y = self.ln2(x)
         y = self.ffn(y)
         y = self.do2(y)
         x = x + y
-        return x
+        return x, new_kv_cache
 
 
 class Transformer(nn.Module):
@@ -249,13 +264,32 @@ class Transformer(nn.Module):
         self.ln_final = RMSNorm(d_model, device=device, dtype=dtype)
         self.lm_head = Linear(d_model, vocab_size, device=device, dtype=dtype)
 
-    def forward(self, x):
+    def _forward(self, x, token_positions=None, kv_caches=None):
         x = self.token_embeddings(x)
-        for layer in self.layers:
-            x = layer(x)
+        new_kv_caches = []
+        for i, layer in enumerate(self.layers):
+            cache = kv_caches[i] if kv_caches is not None else None
+            x, new_cache = layer(x, token_positions, cache)
+            new_kv_caches.append(new_cache)
         x = self.ln_final(x)
         x = self.lm_head(x)
-        return x
+        return x, new_kv_caches
+
+    def forward(self, x, token_positions=None, kv_caches=None):
+        return self._forward(x, token_positions, kv_caches)[0]
+
+    def _sample_token(self, logits, top_p, t):
+        if t == 0:
+            return torch.argmax(logits[:, -1, :], dim=-1, keepdim=True)
+        probs = torch.softmax(logits[:, -1, :] / t, dim=-1)
+        if top_p < 1.0:
+            sorted_values, sorted_idx = probs.sort(-1, descending=True)
+            mask = sorted_values.cumsum(-1) <= top_p
+            mask[:, 0] = True
+            orig_mask = mask.gather(-1, sorted_idx.argsort(-1))
+            probs.masked_fill_(~orig_mask, 0.0)
+            probs /= probs.sum(-1, keepdim=True)
+        return torch.multinomial(probs, 1)
 
     def generate(
         self,
@@ -267,25 +301,20 @@ class Transformer(nn.Module):
     ):
         input_seq = prompt
         with torch.inference_mode():
-            for _ in tqdm(range(max_steps)):
-                logits = self.forward(input_seq)
-                if t == 0:
-                    out = torch.argmax(logits[:, -1, :], dim=-1, keepdim=True)
-                else:
-                    # nucleus sampling
-                    probs = softmax(logits, dim=-1, t=t)[:, -1, :]
-                    if top_p < 1.0:
-                        sorted_values, sorted_idx = probs.sort(-1, descending=True)
-                        mask = sorted_values.cumsum(-1) <= top_p
-                        mask[:, 0] = True  # ensure at least one token is kept
-                        orig_mask = mask.gather(-1, sorted_idx.argsort(-1))
-                        for i in range(len(probs)):
-                            probs[i].masked_fill_(~orig_mask[i], 0.0)
-                            probs[i] /= probs[i].sum(-1)
-                    out = torch.multinomial(probs, 1)
-                input_seq = torch.cat([input_seq, out], dim=-1)
+            # prefill: process entire prompt, build KV cache
+            logits, kv_caches = self._forward(input_seq)
+            out = self._sample_token(logits, top_p, t)
+            input_seq = torch.cat([input_seq, out], dim=-1)
+
+            # decode: one token at a time with KV cache
+            for _ in tqdm(range(max_steps - 1)):
                 if (out[-1:] == eos_token_id).all(dim=-1).item():
                     break
+                seq_len = input_seq.size(1) - 1
+                pos = torch.tensor([[seq_len]], device=input_seq.device)
+                logits, kv_caches = self._forward(out, token_positions=pos, kv_caches=kv_caches)
+                out = self._sample_token(logits, top_p, t)
+                input_seq = torch.cat([input_seq, out], dim=-1)
         return input_seq
 
 
