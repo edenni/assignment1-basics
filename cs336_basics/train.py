@@ -6,8 +6,8 @@ from dataclasses import asdict, dataclass, field
 import torch
 from dataset import Dataset
 from optimizer import AdamW, clip_grad_norm, get_cosine_lr
-# from rust_tokenizer import RustTokenizer as Tokenizer
-from tokenizer import Tokenizer
+from rust_tokenizer import RustTokenizer as Tokenizer
+# from tokenizer import Tokenizer
 from torch import autocast
 from transformers import HfArgumentParser
 from utils import generate, load_checkpoint, save_checkpoint
@@ -83,7 +83,7 @@ if config.wandb_logging:
 
     wandb.init(project=config.wandb_project, name=config.wandb_run_name)
 
-tokenizer = Tokenizer.from_files("outputs/owt_vocab.json", "outputs/owt_merges.txt")
+tokenizer = Tokenizer.from_files("outputs/tinystories_vocab.json", "outputs/tinystories_merges.txt")
 config.vocab_size = tokenizer.vocab_size
 logging.info(f"Training with config: {asdict(config)}")
 dataset = Dataset(config.dataset_name, config.context_length, config.batch_size, device=config.device)

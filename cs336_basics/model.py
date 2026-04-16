@@ -264,10 +264,24 @@ class Transformer(nn.Module):
         self.ln_final = RMSNorm(d_model, device=device, dtype=dtype)
         self.lm_head = Linear(d_model, vocab_size, device=device, dtype=dtype)
 
+        # Pre-layer scaler
+        # resid_lambdas: scales the residual stream at each layer (init 1.0 = neutral)
+        # x0_lambdas: blends initial embedding back in at each layer (init 0.0 = disabled)
+        # Separate parameters so they can have different optimizer treatment
+        self.resid_lambdas = nn.Parameter(torch.ones(num_layers, device=device))
+        self.x0_lambdas = nn.Parameter(torch.ones(num_layers, device=device))
+        for i in range(num_layers):
+            self.resid_lambdas.data[i] = 1.15 - (0.10 * i / max(num_layers - 1, 1))
+        # Decaying x0 init: earlier layers get more input embedding blending
+        for i in range(num_layers):
+            self.x0_lambdas.data[i] = 0.20 - (0.15 * i / max(num_layers - 1, 1))
+
     def _forward(self, x, token_positions=None, kv_caches=None):
         x = self.token_embeddings(x)
         new_kv_caches = []
+        x0 = x
         for i, layer in enumerate(self.layers):
+            x = self.resid_lambdas[i] * x + self.x0_lambdas[i] * x0
             cache = kv_caches[i] if kv_caches is not None else None
             x, new_cache = layer(x, token_positions, cache)
             new_kv_caches.append(new_cache)
