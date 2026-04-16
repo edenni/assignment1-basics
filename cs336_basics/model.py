@@ -3,6 +3,9 @@ import math
 import torch
 import torch.nn as nn
 from einops import rearrange, repeat
+from tqdm import tqdm
+
+from cs336_systems.fa2_torch import TritonFlashAttnFunc
 
 
 class Linear(nn.Module):
@@ -146,34 +149,42 @@ def scaled_dot_product_attention(q, k, v, mask=None, dropout=0.0):
 
 
 class MultiHeadSelfAttention(nn.Module):
-    def __init__(self, d_model, num_heads, theta=10000, max_seq_len=8192, dropout=0.1, device=None, dtype=None):
+    def __init__(self, d_model, num_heads, num_kv_heads=None, theta=10000, max_seq_len=8192, dropout=0.1, device=None, dtype=None):
         super().__init__()
-        assert d_model % num_heads == 0
         self.d_model = d_model
         self.num_heads = num_heads
-        self.d_head = self.d_model // self.num_heads
-        self.qkv_proj = Linear(d_model, 3 * d_model, device=device, dtype=dtype)
+        self.num_kv_heads = num_kv_heads if num_kv_heads is not None else num_heads
+        assert d_model % num_heads == 0
+        assert num_heads % self.num_kv_heads == 0
+        self.d_head = d_model // num_heads
+        self.num_groups = num_heads // self.num_kv_heads  # Q heads per KV head
+
+        self.q_proj = Linear(d_model, num_heads * self.d_head, device=device, dtype=dtype)
+        self.k_proj = Linear(d_model, self.num_kv_heads * self.d_head, device=device, dtype=dtype)
+        self.v_proj = Linear(d_model, self.num_kv_heads * self.d_head, device=device, dtype=dtype)
         self.o_proj = Linear(d_model, d_model, device=device, dtype=dtype)
         if theta > 0:
-            self.rope = RotaryPositionalEmbedding(theta, d_model // num_heads, max_seq_len, device=device)
+            self.rope = RotaryPositionalEmbedding(theta, self.d_head, max_seq_len, device=device)
         else:
             self.rope = None
         self.dropout = dropout
 
     def forward(self, x, token_positions=None):
         B, L, D = x.size()
-        qkv = self.qkv_proj(x)
-        q, k, v = qkv.chunk(3, dim=-1)
-        q = q.view(B, L, self.num_heads, self.d_head).transpose(1, 2)
-        k = k.view(B, L, self.num_heads, self.d_head).transpose(1, 2)
-        v = v.view(B, L, self.num_heads, self.d_head).transpose(1, 2)
+        q = self.q_proj(x).view(B, L, self.num_heads, self.d_head).transpose(1, 2).contiguous()
+        k = self.k_proj(x).view(B, L, self.num_kv_heads, self.d_head).transpose(1, 2).contiguous()
+        v = self.v_proj(x).view(B, L, self.num_kv_heads, self.d_head).transpose(1, 2).contiguous()
 
         if self.rope:
             q = self.rope(q, token_positions)
             k = self.rope(k, token_positions)
 
-        mask = torch.tril(torch.ones(L, L, device=q.device)).unsqueeze(0).bool()
-        y = scaled_dot_product_attention(q, k, v, mask, self.training and self.dropout)
+        # expand KV heads to match Q heads: (B, num_kv_heads, L, d) -> (B, num_heads, L, d)
+        if self.num_groups > 1:
+            k = k.unsqueeze(2).expand(-1, -1, self.num_groups, -1, -1).reshape(B, self.num_heads, L, self.d_head).contiguous()
+            v = v.unsqueeze(2).expand(-1, -1, self.num_groups, -1, -1).reshape(B, self.num_heads, L, self.d_head).contiguous()
+
+        y = TritonFlashAttnFunc.apply(q, k, v, True)
         y = y.transpose(1, 2).contiguous().view(B, L, D)
         o = self.o_proj(y)
         return o
@@ -187,12 +198,13 @@ class TransformerBlock(nn.Module):
         d_ff: int,
         max_seq_len: int,
         theta: float,
+        num_kv_heads: int | None = None,
         dropout: float = 0.1,
         device=None,
         dtype=None,
     ):
         super().__init__()
-        self.attn = MultiHeadSelfAttention(d_model, num_heads, theta, max_seq_len, dropout, device=device, dtype=dtype)
+        self.attn = MultiHeadSelfAttention(d_model, num_heads, num_kv_heads, theta, max_seq_len, dropout, device=device, dtype=dtype)
         self.ln1 = RMSNorm(d_model, device=device, dtype=dtype)
         self.ln2 = RMSNorm(d_model, device=device, dtype=dtype)
         self.ffn = SwiGLU(d_model, d_ff, device=device, dtype=dtype)
@@ -221,6 +233,7 @@ class Transformer(nn.Module):
         num_heads: int,
         d_ff: int,
         theta: float = 10_000,
+        num_kv_heads: int | None = None,
         dropout: float = 0.1,
         device=None,
         dtype=None,
@@ -229,7 +242,7 @@ class Transformer(nn.Module):
         self.token_embeddings = Embedding(vocab_size, d_model, device=device, dtype=dtype)
         self.layers = nn.ModuleList(
             [
-                TransformerBlock(d_model, num_heads, d_ff, context_length, theta, dropout, device=device, dtype=dtype)
+                TransformerBlock(d_model, num_heads, d_ff, context_length, theta, num_kv_heads, dropout, device=device, dtype=dtype)
                 for _ in range(num_layers)
             ]
         )
@@ -254,7 +267,7 @@ class Transformer(nn.Module):
     ):
         input_seq = prompt
         with torch.inference_mode():
-            for _ in range(max_steps):
+            for _ in tqdm(range(max_steps)):
                 logits = self.forward(input_seq)
                 if t == 0:
                     out = torch.argmax(logits[:, -1, :], dim=-1, keepdim=True)

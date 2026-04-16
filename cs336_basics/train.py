@@ -6,6 +6,7 @@ from dataclasses import asdict, dataclass, field
 import torch
 from dataset import Dataset
 from optimizer import AdamW, clip_grad_norm, get_cosine_lr
+# from rust_tokenizer import RustTokenizer as Tokenizer
 from tokenizer import Tokenizer
 from torch import autocast
 from transformers import HfArgumentParser
@@ -34,6 +35,7 @@ class TrainingConfig:
     num_heads: int | None = field(default=12)
     d_ff: int | None = field(default=3072)
     dropout: float | None = field(default=0.1)
+    num_kv_heads: int | None = field(default=3)
     # attn_pdrop: float | None = field(default=0.1)
     # resid_pdrop: float | None = field(default=0.1)
     init_from: str = field(default="scratch")
@@ -80,10 +82,10 @@ if config.wandb_logging:
     import wandb
 
     wandb.init(project=config.wandb_project, name=config.wandb_run_name)
-logging.info(f"Training with config: {asdict(config)}")
 
-tokenizer = Tokenizer.from_files("outputs/tinystories_vocab.json", "outputs/tinystories_merges.txt")
+tokenizer = Tokenizer.from_files("outputs/owt_vocab.json", "outputs/owt_merges.txt")
 config.vocab_size = tokenizer.vocab_size
+logging.info(f"Training with config: {asdict(config)}")
 dataset = Dataset(config.dataset_name, config.context_length, config.batch_size, device=config.device)
 model = Transformer(
     num_layers=config.num_layers,
@@ -93,9 +95,11 @@ model = Transformer(
     num_heads=config.num_heads,
     d_ff=config.d_ff,
     dropout=config.dropout,
+    num_kv_heads=config.num_kv_heads,
     device=config.device,
 )
 model.to(config.device)
+model = torch.compile(model)
 logging.info(f"Model size: {sum(p.numel() for p in model.parameters()) / 1e6:.2f}M")
 optimizer = AdamW(model.parameters(), lr=config.lr_max, weight_decay=config.weight_decay)
 if config.init_from != "scratch":
@@ -154,7 +158,8 @@ while iter_num < config.total_iters:
         eval()
     if iter_num % config.gen_iters == 0:
         prompt = "Once upon a time"
-        gen_seq = generate(prompt, model, tokenizer, top_p=0.9, t=1.0, max_steps=100, device=config.device)
+        with cast_context:
+            gen_seq = generate(prompt, model, tokenizer, top_p=0.9, t=1.0, max_steps=100, device=config.device)
         gen_text = tokenizer.decode(gen_seq.tolist()[0])
         logging.info(f"Iter: {iter_num}, Prompt: {prompt}, Generated: {gen_text}")
 
