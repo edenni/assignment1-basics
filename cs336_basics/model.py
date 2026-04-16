@@ -149,7 +149,7 @@ def scaled_dot_product_attention(q, k, v, mask=None, dropout=0.0):
 
 
 class MultiHeadSelfAttention(nn.Module):
-    def __init__(self, d_model, num_heads, num_kv_heads=None, theta=10000, max_seq_len=8192, dropout=0.1, device=None, dtype=None):
+    def __init__(self, d_model, num_heads, num_kv_heads=None, theta=10000, max_seq_len=8192, dropout=0.1, use_ve=False, device=None, dtype=None):
         super().__init__()
         self.d_model = d_model
         self.num_heads = num_heads
@@ -168,12 +168,19 @@ class MultiHeadSelfAttention(nn.Module):
         else:
             self.rope = None
         self.dropout = dropout
+        self.ve_gate_channels = 12
+        self.ve_gate = Linear(self.ve_gate_channels, num_kv_heads, device=device, dtype=dtype) if use_ve else None
 
-    def forward(self, x, token_positions=None, kv_cache=None):
+    def forward(self, x, ve=None, token_positions=None, kv_cache=None):
         B, L, D = x.size()
         q = self.q_proj(x).view(B, L, self.num_heads, self.d_head).transpose(1, 2)
         k = self.k_proj(x).view(B, L, self.num_kv_heads, self.d_head).transpose(1, 2)
         v = self.v_proj(x).view(B, L, self.num_kv_heads, self.d_head).transpose(1, 2)
+
+        if ve is not None:
+            ve = ve.view(B, L, self.num_kv_heads, self.d_head).transpose(1, 2).to(v.dtype)
+            gate = 3 * torch.sigmoid(self.ve_gate(x[..., :self.ve_gate_channels])).transpose(1, 2)
+            v = v + gate.unsqueeze(-1) * ve
 
         if self.rope:
             q = self.rope(q, token_positions)
@@ -215,20 +222,21 @@ class TransformerBlock(nn.Module):
         theta: float,
         num_kv_heads: int | None = None,
         dropout: float = 0.1,
+        use_ve: bool = False,
         device=None,
         dtype=None,
     ):
         super().__init__()
-        self.attn = MultiHeadSelfAttention(d_model, num_heads, num_kv_heads, theta, max_seq_len, dropout, device=device, dtype=dtype)
+        self.attn = MultiHeadSelfAttention(d_model, num_heads, num_kv_heads, theta, max_seq_len, dropout, use_ve, device=device, dtype=dtype)
         self.ln1 = RMSNorm(d_model, device=device, dtype=dtype)
         self.ln2 = RMSNorm(d_model, device=device, dtype=dtype)
         self.ffn = SwiGLU(d_model, d_ff, device=device, dtype=dtype)
         self.do1 = Dropout(dropout)
         self.do2 = Dropout(dropout)
 
-    def forward(self, x, token_positions=None, kv_cache=None):
+    def forward(self, x, ve=None, token_positions=None, kv_cache=None):
         y = self.ln1(x)
-        y, new_kv_cache = self.attn(y, token_positions, kv_cache)
+        y, new_kv_cache = self.attn(y, ve, token_positions, kv_cache)
         y = self.do1(y)
         x = x + y
         y = self.ln2(x)
@@ -236,6 +244,11 @@ class TransformerBlock(nn.Module):
         y = self.do2(y)
         x = x + y
         return x, new_kv_cache
+
+
+def has_ve(layer_idx, n_layer):
+    """Returns True if GPT layer should have Value Embedding (alternating, last layer always included)."""
+    return layer_idx % 2 == (n_layer - 1) % 2
 
 
 class Transformer(nn.Module):
@@ -250,6 +263,7 @@ class Transformer(nn.Module):
         theta: float = 10_000,
         num_kv_heads: int | None = None,
         dropout: float = 0.1,
+        use_ve: bool = False,
         device=None,
         dtype=None,
     ):
@@ -257,7 +271,7 @@ class Transformer(nn.Module):
         self.token_embeddings = Embedding(vocab_size, d_model, device=device, dtype=dtype)
         self.layers = nn.ModuleList(
             [
-                TransformerBlock(d_model, num_heads, d_ff, context_length, theta, num_kv_heads, dropout, device=device, dtype=dtype)
+                TransformerBlock(d_model, num_heads, d_ff, context_length, theta, num_kv_heads, dropout, use_ve, device=device, dtype=dtype)
                 for _ in range(num_layers)
             ]
         )
@@ -275,15 +289,21 @@ class Transformer(nn.Module):
         # Decaying x0 init: earlier layers get more input embedding blending
         for i in range(num_layers):
             self.x0_lambdas.data[i] = 0.20 - (0.15 * i / max(num_layers - 1, 1))
+        
+        # Value embeddings
+        d_head = d_model // num_heads
+        kv_dim = num_kv_heads * d_head
+        self.value_embeds = nn.ModuleDict({str(i): Embedding(vocab_size, kv_dim, device=device, dtype=dtype) for i in range(num_layers) if has_ve(i, num_layers)}) if use_ve else dict()
 
-    def _forward(self, x, token_positions=None, kv_caches=None):
-        x = self.token_embeddings(x)
+    def _forward(self, idx, token_positions=None, kv_caches=None):
+        x = self.token_embeddings(idx)
         new_kv_caches = []
         x0 = x
         for i, layer in enumerate(self.layers):
             x = self.resid_lambdas[i] * x + self.x0_lambdas[i] * x0
+            ve = self.value_embeds[str(i)](idx).to(x.dtype) if str(i) in self.value_embeds else None
             cache = kv_caches[i] if kv_caches is not None else None
-            x, new_cache = layer(x, token_positions, cache)
+            x, new_cache = layer(x, ve, token_positions, cache)
             new_kv_caches.append(new_cache)
         x = self.ln_final(x)
         x = self.lm_head(x)
@@ -322,7 +342,7 @@ class Transformer(nn.Module):
         input_seq = torch.cat([input_seq, out], dim=-1)
 
         # decode: one token at a time with KV cache
-        for _ in tqdm(range(max_steps - 1)):
+        for _ in tqdm(range(max_steps - 1), desc="Generation"):
             if (out[-1:] == eos_token_id).all(dim=-1).item():
                 break
             seq_len = input_seq.size(1) - 1

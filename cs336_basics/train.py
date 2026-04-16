@@ -36,6 +36,7 @@ class TrainingConfig:
     d_ff: int | None = field(default=3072)
     dropout: float | None = field(default=0.1)
     num_kv_heads: int | None = field(default=3)
+    use_ve: bool | None = field(default=False)
     # attn_pdrop: float | None = field(default=0.1)
     # resid_pdrop: float | None = field(default=0.1)
     init_from: str = field(default="scratch")
@@ -96,6 +97,7 @@ model = Transformer(
     d_ff=config.d_ff,
     dropout=config.dropout,
     num_kv_heads=config.num_kv_heads,
+    use_ve=config.use_ve,
     device=config.device,
 )
 model.to(config.device)
