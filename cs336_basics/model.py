@@ -171,9 +171,9 @@ class MultiHeadSelfAttention(nn.Module):
 
     def forward(self, x, token_positions=None, kv_cache=None):
         B, L, D = x.size()
-        q = self.q_proj(x).view(B, L, self.num_heads, self.d_head).transpose(1, 2).contiguous()
-        k = self.k_proj(x).view(B, L, self.num_kv_heads, self.d_head).transpose(1, 2).contiguous()
-        v = self.v_proj(x).view(B, L, self.num_kv_heads, self.d_head).transpose(1, 2).contiguous()
+        q = self.q_proj(x).view(B, L, self.num_heads, self.d_head).transpose(1, 2)
+        k = self.k_proj(x).view(B, L, self.num_kv_heads, self.d_head).transpose(1, 2)
+        v = self.v_proj(x).view(B, L, self.num_kv_heads, self.d_head).transpose(1, 2)
 
         if self.rope:
             q = self.rope(q, token_positions)
@@ -190,8 +190,8 @@ class MultiHeadSelfAttention(nn.Module):
         S = k.size(2)
         k_exp, v_exp = k, v
         if self.num_groups > 1:
-            k_exp = k.unsqueeze(2).expand(-1, -1, self.num_groups, -1, -1).reshape(B, self.num_heads, S, self.d_head).contiguous()
-            v_exp = v.unsqueeze(2).expand(-1, -1, self.num_groups, -1, -1).reshape(B, self.num_heads, S, self.d_head).contiguous()
+            k_exp = k.unsqueeze(2).expand(-1, -1, self.num_groups, -1, -1).reshape(B, self.num_heads, S, self.d_head)
+            v_exp = v.unsqueeze(2).expand(-1, -1, self.num_groups, -1, -1).reshape(B, self.num_heads, S, self.d_head)
 
         if kv_cache is not None:
             # single-token decode: use simple matmul attention (flash attention overhead not worth it for L=1)

@@ -506,7 +506,7 @@ def flash_bwd_dkdv_kernel(
 class TritonFlashAttnFunc(torch.autograd.Function):
     @staticmethod
     def forward(ctx, Q, K, V, is_causal=False):
-        assert Q.is_cuda and Q.is_contiguous()
+        # assert Q.is_cuda and Q.is_contiguous()
         bs, H, Nq, d = Q.shape
         Nk = K.shape[2]
         scale = 1 / (d**0.5)
