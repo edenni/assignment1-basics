@@ -130,7 +130,7 @@ def generate(
     eos_token: str = "<|endoftext|>",
     device=None,
 ):
-    eos_token_id = tokenizer.inv_vocab[eos_token.encode("utf-8")]
+    eos_token_id = 256 #! rust tokenizer doesn't have `inv_vocab`, hard coding this for now
     prompt = torch.Tensor(tokenizer.encode(prompt)).long().unsqueeze(0)
     if device is not None:
         prompt = prompt.to(device)
