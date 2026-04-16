@@ -305,6 +305,7 @@ class Transformer(nn.Module):
             probs /= probs.sum(-1, keepdim=True)
         return torch.multinomial(probs, 1)
 
+    @torch.inference_mode()
     def generate(
         self,
         prompt,
@@ -314,21 +315,21 @@ class Transformer(nn.Module):
         max_steps: int = 32,
     ):
         input_seq = prompt
-        with torch.inference_mode():
-            # prefill: process entire prompt, build KV cache
-            logits, kv_caches = self._forward(input_seq)
+
+        # prefill: process entire prompt, build KV cache
+        logits, kv_caches = self._forward(input_seq)
+        out = self._sample_token(logits, top_p, t)
+        input_seq = torch.cat([input_seq, out], dim=-1)
+
+        # decode: one token at a time with KV cache
+        for _ in tqdm(range(max_steps - 1)):
+            if (out[-1:] == eos_token_id).all(dim=-1).item():
+                break
+            seq_len = input_seq.size(1) - 1
+            pos = torch.tensor([[seq_len]], device=input_seq.device)
+            logits, kv_caches = self._forward(out, token_positions=pos, kv_caches=kv_caches)
             out = self._sample_token(logits, top_p, t)
             input_seq = torch.cat([input_seq, out], dim=-1)
-
-            # decode: one token at a time with KV cache
-            for _ in tqdm(range(max_steps - 1)):
-                if (out[-1:] == eos_token_id).all(dim=-1).item():
-                    break
-                seq_len = input_seq.size(1) - 1
-                pos = torch.tensor([[seq_len]], device=input_seq.device)
-                logits, kv_caches = self._forward(out, token_positions=pos, kv_caches=kv_caches)
-                out = self._sample_token(logits, top_p, t)
-                input_seq = torch.cat([input_seq, out], dim=-1)
         return input_seq
 
 
