@@ -2,11 +2,13 @@ import logging
 import time
 from contextlib import nullcontext
 from dataclasses import asdict, dataclass, field
+from functools import partial
 
 import torch
 from dataset import Dataset
-from optimizer import AdamW, clip_grad_norm, get_cosine_lr
+from optimizer import AdamW, clip_grad_norm, get_linear_lr
 from rust_tokenizer import RustTokenizer as Tokenizer
+
 # from tokenizer import Tokenizer
 from torch import autocast
 from transformers import HfArgumentParser
@@ -44,6 +46,8 @@ class TrainingConfig:
     # training parameters (additional adamW parameter use as default)
     total_iters: int | None = field(default=10 * (10**3))
     warmup_iters: int | None = field(default=None)
+    warmdown_ratio: float | None = field(default=0.65)
+    final_lr_frac: float | None = field(default=0.05)
     lr_max: float | None = field(default=5e-4)
     lr_min: float | None = field(default=0)
     weight_decay: float | None = field(default=0.001)
@@ -100,14 +104,32 @@ model = Transformer(
     use_ve=config.use_ve,
     device=config.device,
 )
-model.to(config.device)
-model = torch.compile(model)
 logging.info(f"Model size: {sum(p.numel() for p in model.parameters()) / 1e6:.2f}M")
-optimizer = AdamW(model.parameters(), lr=config.lr_max, weight_decay=config.weight_decay)
+
+embedding_lr=0.05
+matrix_lr=0.001
+scalar_lr=0.1
+head_lr=0.004
+dmodel_lr_scale = (config.d_model / 768) ** -0.5
+param_groups = [
+    {"params": model.token_embeddings.parameters(), "lr": embedding_lr * dmodel_lr_scale, "weight_decay": 0.001, "eps": 1e-10},
+    {"params": model.value_embeds.parameters(), "lr": 0.5 * embedding_lr * dmodel_lr_scale, "weight_decay": 0.01, "eps": 1e-10},
+    {"params": model.resid_lambdas, "lr": 0.01 * scalar_lr, "weight_decay": 0.05, "eps": 1e-10},
+    {"params": model.x0_lambdas, "lr": scalar_lr, "weight_decay": 0.0, "eps": 1e-10},
+    {"params": model.layers.parameters(), "lr": matrix_lr, "weight_decay": 0.001, "eps": 1e-10},
+    {"params": model.lm_head.parameters(), "lr": head_lr * dmodel_lr_scale, "weight_decay": 0.01, "eps": 1e-10},
+
+]
+optimizer = AdamW(params=param_groups)
+
+get_lr_multiplier = partial(get_linear_lr, num_iterations=config.total_iters, warmup_iters=config.warmup_iters, warmdown_ratio=config.warmdown_ratio, final_lr_frac=config.final_lr_frac)
+
 if config.init_from != "scratch":
     ckpt_dir = f"outputs/checkpoints/{config.init_from}"
     iter_num = load_checkpoint(model, optimizer, ckpt_dir)
 
+model.to(config.device)
+model = torch.compile(model)
 cast_context = autocast(device_type=config.device, dtype=torch.bfloat16) if config.precision == "bf16" else nullcontext()
 
 def eval():
@@ -122,9 +144,9 @@ def eval():
                 loss = cross_entropy(logits, y)
             total_loss += loss.item()
     total_loss /= config.eval_iters
-    logging.info(f"Iter: {iter_num}, Val loss: {loss.item():.4f}, LR: {lr:.6f}")
+    logging.info(f"Iter: {iter_num}, Val loss: {loss.item():.4f}")
     if config.wandb_logging:
-        wandb.log({"val/loss": total_loss, "lr": lr, "step": iter_num})
+        wandb.log({"val/loss": total_loss, "step": iter_num})
         save_checkpoint(model, optimizer, iter_num, f"outputs/checkpoints/{config.wandb_run_name}.pt")
     model.train()
 
@@ -145,17 +167,20 @@ while iter_num < config.total_iters:
         loss = cross_entropy(logits, y)
     loss.backward()
     clip_grad_norm(model.parameters(), 1.0)
-    lr = get_cosine_lr(iter_num, config.lr_max, config.lr_min, config.warmup_iters, config.total_iters)
-    optimizer.set_lr(lr)
+    # lr = get_cosine_lr(iter_num, config.lr_max, config.lr_min, config.warmup_iters, config.total_iters)
+    # optimizer.set_lr(lr)
+    lrm = get_lr_multiplier(iter_num)
+    for group in optimizer.param_groups:
+        group["lr"] = group["initial_lr"] * lrm
     optimizer.step()
     finish_time = time.time()
 
     if iter_num % config.log_interval == 0:
         logging.info(
-            f"Iter: {iter_num}, Train loss: {loss.item():.4f}, LR: {lr:.6f}, Time: {1000 * (finish_time - curr_time):.2f}ms"
+            f"Iter: {iter_num}, Train loss: {loss.item():.4f}, Time: {1000 * (finish_time - curr_time):.2f}ms"
         )
         if config.wandb_logging:
-            wandb.log({"train/loss": loss.item(), "lr": lr, "step": iter_num})
+            wandb.log({"train/loss": loss.item(), "train/lrm": lrm, "step": iter_num})
     if iter_num % config.eval_interval == 0:
         eval()
     if iter_num % config.gen_iters == 0:

@@ -8,6 +8,9 @@ class AdamW(optim.Optimizer):
     def __init__(self, params, lr=1e-3, betas=(0.9, 0.999), eps=1e-8, weight_decay=0):
         defaults = {"lr": lr, "betas": betas, "eps": eps, "weight_decay": weight_decay}
         super().__init__(params, defaults)
+        # Save initial lr
+        for group in params:
+            group["initial_lr"] = group["lr"]
 
     def set_lr(self, lr):
         for group in self.param_groups:
@@ -51,6 +54,17 @@ def get_cosine_lr(t: int, lr_max: float, lr_min: float, warmup_steps: int, cosin
         return cos_lr
     else:
         return lr_min
+
+# Learning rate schedule (linear warmup, constant, linear warmdown)
+def get_linear_lr(it, warmup_iters, warmdown_ratio, num_iterations, final_lr_frac):
+    warmdown_iters = round(warmdown_ratio * num_iterations)
+    if it < warmup_iters:
+        return (it + 1) / warmup_iters
+    elif it <= num_iterations - warmdown_iters:
+        return 1.0
+    else:
+        progress = (num_iterations - it) / warmdown_iters
+        return progress * 1.0 + (1 - progress) * final_lr_frac
 
 
 def clip_grad_norm(params, max_norm: float = 1.0, eps: float = 1e-6):
