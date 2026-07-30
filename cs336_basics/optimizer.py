@@ -68,10 +68,19 @@ def get_linear_lr(it, warmup_iters, warmdown_ratio, num_iterations, final_lr_fra
 
 
 def clip_grad_norm(params, max_norm: float = 1.0, eps: float = 1e-6):
-    total_norm = sum([torch.sum(p.grad**2) for p in params if p.grad is not None])
-    total_norm = total_norm**0.5
-    if total_norm >= max_norm:
-        with torch.no_grad():
-            for p in params:
-                if p.grad is not None:
-                    p.grad.mul_(max_norm / (total_norm + eps))
+    # Align to pytorch total_norm = sqrt(sum(||g_i||_2^2))
+    # Not sqrt(sum(sum(g_ij^2)))
+    grads = [p.grad for p in params if p.grad is not None]
+    if len(grads) == 0:
+        return torch.tensor(0.0)
+    
+    norms = [g.detach().norm(2) for g in grads]
+    total_norm = torch.stack(norms).norm(2)
+
+    clip_coef = max_norm / (total_norm + eps)
+    clip_coef_clamped = torch.clamp(clip_coef, max=1.0)
+
+    for g in grads:
+        g.mul_(clip_coef_clamped)
+    
+    return total_norm
